@@ -19,11 +19,13 @@
 ## Scoring Model
 The script mirrors `codex-rs/state/src/runtime/summaries.rs` for sparse hybrid ranking:
 - Semantic score: cosine-style sparse match from `summary_node_semantic_terms`.
+  - adjusted by query-term coverage so broader concept matches rank higher.
 - Lexical score weights:
   - file path match: `0.8`
-  - command match: `1.0`
+  - command match: `1.0` (or `1.25` when `exit_code != 0`)
   - error text match: `1.2`
   - title match: `0.6`
+  - adjusted by distinct matched query-term coverage.
 - Hybrid score: `0.7 * normalized_semantic + 0.3 * normalized_lexical`.
 
 ## Practical Notes

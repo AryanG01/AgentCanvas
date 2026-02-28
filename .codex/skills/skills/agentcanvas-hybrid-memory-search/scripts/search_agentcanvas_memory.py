@@ -26,6 +26,9 @@ from typing import Any
 
 HYBRID_SEMANTIC_WEIGHT = 0.7
 HYBRID_LEXICAL_WEIGHT = 0.3
+SEMANTIC_COVERAGE_BASE_WEIGHT = 0.6
+LEXICAL_COVERAGE_BASE_WEIGHT = 0.5
+LEXICAL_COMMAND_FAILURE_WEIGHT = 1.25
 MAX_FEATURES = 96
 
 
@@ -242,6 +245,22 @@ def lexical_terms_from_text(text: str) -> list[str]:
     return sorted(set(semantic_tokens(text)))
 
 
+def coverage_adjusted_score(
+    raw_score: float,
+    matched_term_count: int,
+    query_term_count: int,
+    coverage_base_weight: float,
+) -> float:
+    if raw_score <= 0.0 or query_term_count <= 0:
+        return max(raw_score, 0.0)
+    matched_term_count = min(max(matched_term_count, 0), query_term_count)
+    coverage_ratio = matched_term_count / query_term_count
+    coverage_base_weight = max(min(coverage_base_weight, 1.0), 0.0)
+    return raw_score * (
+        coverage_base_weight + ((1.0 - coverage_base_weight) * coverage_ratio)
+    )
+
+
 def values_clause(rows: int, columns: int) -> str:
     single = "(" + ", ".join(["?"] * columns) + ")"
     return ", ".join([single] * rows)
@@ -274,7 +293,8 @@ scored_nodes AS (
     SELECT
         terms.summary_id,
         terms.node_id,
-        SUM(terms.weight * query_terms.query_weight) AS semantic_score
+        SUM(terms.weight * query_terms.query_weight) AS raw_semantic_score,
+        COUNT(DISTINCT query_terms.term_hash) AS matched_term_count
     FROM summary_node_semantic_terms AS terms
     INNER JOIN query_terms
         ON query_terms.term_hash = terms.term_hash
@@ -282,7 +302,7 @@ scored_nodes AS (
         ON artifacts.summary_id = terms.summary_id
     {thread_filter_sql}
     GROUP BY terms.summary_id, terms.node_id
-    ORDER BY semantic_score DESC
+    ORDER BY raw_semantic_score DESC
     LIMIT ?
 )
 SELECT
@@ -298,7 +318,9 @@ SELECT
     file_paths.sample_file_path,
     commands.sample_command,
     errors.sample_error_text,
-    scored_nodes.semantic_score
+    scored_nodes.raw_semantic_score AS semantic_score,
+    scored_nodes.raw_semantic_score,
+    scored_nodes.matched_term_count
 FROM scored_nodes
 INNER JOIN summary_nodes AS nodes
     ON nodes.summary_id = scored_nodes.summary_id
@@ -326,7 +348,7 @@ LEFT JOIN (
 ) AS errors
     ON errors.summary_id = nodes.summary_id
     AND errors.node_id = nodes.node_id
-ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
+ORDER BY scored_nodes.raw_semantic_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
 """
 
     params: list[Any] = []
@@ -338,6 +360,14 @@ ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node
     rows = conn.execute(sql, params).fetchall()
     out: dict[tuple[str, str], RankedNode] = {}
     for row in rows:
+        raw_semantic_score = float(row[13] or 0.0)
+        matched_term_count = int(row[14] or 0)
+        semantic_score = coverage_adjusted_score(
+            raw_semantic_score,
+            matched_term_count,
+            len(terms),
+            SEMANTIC_COVERAGE_BASE_WEIGHT,
+        )
         key = (row[0], row[4])
         out[key] = RankedNode(
             summary_id=row[0],
@@ -352,9 +382,9 @@ ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node
             sample_file_path=row[9],
             sample_command=row[10],
             sample_error_text=row[11],
-            semantic_score=float(row[12] or 0.0),
+            semantic_score=semantic_score,
             lexical_score=0.0,
-            hybrid_score=float(row[12] or 0.0),
+            hybrid_score=semantic_score,
         )
     return out
 
@@ -380,7 +410,8 @@ lexical_hits AS (
     SELECT
         file_paths.summary_id,
         file_paths.node_id,
-        0.8 AS lexical_weight
+        0.8 AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_node_file_paths AS file_paths
     INNER JOIN query_terms
         ON INSTR(LOWER(file_paths.file_path), query_terms.term) > 0
@@ -388,7 +419,11 @@ lexical_hits AS (
     SELECT
         commands.summary_id,
         commands.node_id,
-        1.0 AS lexical_weight
+        CASE
+            WHEN commands.exit_code IS NOT NULL AND commands.exit_code != 0 THEN {LEXICAL_COMMAND_FAILURE_WEIGHT}
+            ELSE 1.0
+        END AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_node_commands AS commands
     INNER JOIN query_terms
         ON INSTR(LOWER(commands.command), query_terms.term) > 0
@@ -396,7 +431,8 @@ lexical_hits AS (
     SELECT
         errors.summary_id,
         errors.node_id,
-        1.2 AS lexical_weight
+        1.2 AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_node_errors AS errors
     INNER JOIN query_terms
         ON INSTR(LOWER(errors.error_text), query_terms.term) > 0
@@ -404,7 +440,8 @@ lexical_hits AS (
     SELECT
         nodes.summary_id,
         nodes.node_id,
-        0.6 AS lexical_weight
+        0.6 AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_nodes AS nodes
     INNER JOIN query_terms
         ON INSTR(LOWER(COALESCE(nodes.title, '')), query_terms.term) > 0
@@ -413,13 +450,14 @@ scored_nodes AS (
     SELECT
         lexical_hits.summary_id,
         lexical_hits.node_id,
-        SUM(lexical_hits.lexical_weight) AS lexical_score
+        SUM(lexical_hits.lexical_weight) AS raw_lexical_score,
+        COUNT(DISTINCT lexical_hits.matched_term) AS matched_term_count
     FROM lexical_hits
     INNER JOIN summary_artifacts AS artifacts
         ON artifacts.summary_id = lexical_hits.summary_id
     {thread_filter_sql}
     GROUP BY lexical_hits.summary_id, lexical_hits.node_id
-    ORDER BY lexical_score DESC
+    ORDER BY raw_lexical_score DESC
     LIMIT ?
 )
 SELECT
@@ -435,7 +473,9 @@ SELECT
     file_paths.sample_file_path,
     commands.sample_command,
     errors.sample_error_text,
-    scored_nodes.lexical_score
+    scored_nodes.raw_lexical_score AS lexical_score,
+    scored_nodes.raw_lexical_score,
+    scored_nodes.matched_term_count
 FROM scored_nodes
 INNER JOIN summary_nodes AS nodes
     ON nodes.summary_id = scored_nodes.summary_id
@@ -463,7 +503,7 @@ LEFT JOIN (
 ) AS errors
     ON errors.summary_id = nodes.summary_id
     AND errors.node_id = nodes.node_id
-ORDER BY scored_nodes.lexical_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
+ORDER BY scored_nodes.raw_lexical_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
 """
 
     params: list[Any] = []
@@ -475,6 +515,14 @@ ORDER BY scored_nodes.lexical_score DESC, artifacts.updated_at DESC, nodes.node_
     rows = conn.execute(sql, params).fetchall()
     out: dict[tuple[str, str], RankedNode] = {}
     for row in rows:
+        raw_lexical_score = float(row[13] or 0.0)
+        matched_term_count = int(row[14] or 0)
+        lexical_score = coverage_adjusted_score(
+            raw_lexical_score,
+            matched_term_count,
+            len(terms),
+            LEXICAL_COVERAGE_BASE_WEIGHT,
+        )
         key = (row[0], row[4])
         out[key] = RankedNode(
             summary_id=row[0],
@@ -490,8 +538,8 @@ ORDER BY scored_nodes.lexical_score DESC, artifacts.updated_at DESC, nodes.node_
             sample_command=row[10],
             sample_error_text=row[11],
             semantic_score=0.0,
-            lexical_score=float(row[12] or 0.0),
-            hybrid_score=float(row[12] or 0.0),
+            lexical_score=lexical_score,
+            hybrid_score=lexical_score,
         )
     return out
 

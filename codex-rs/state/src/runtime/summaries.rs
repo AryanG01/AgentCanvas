@@ -15,6 +15,9 @@ const SUMMARY_SEMANTIC_JINA_API_URL_ENV: &str = "JINA_EMBEDDINGS_API_URL";
 const SUMMARY_SEMANTIC_JINA_DEFAULT_API_URL: &str = "https://api.jina.ai/v1/embeddings";
 const HYBRID_SEMANTIC_WEIGHT: f64 = 0.7;
 const HYBRID_LEXICAL_WEIGHT: f64 = 0.3;
+const SEMANTIC_COVERAGE_BASE_WEIGHT: f64 = 0.6;
+const LEXICAL_COVERAGE_BASE_WEIGHT: f64 = 0.5;
+const LEXICAL_COMMAND_FAILURE_WEIGHT: f64 = 1.25;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct IndexedCommand {
@@ -669,7 +672,9 @@ LIMIT ?
             return Ok(Vec::new());
         }
 
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let query_term_count = query_terms.len();
+        let candidate_limit = limit.saturating_mul(4).max(limit);
+        let candidate_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
         let mut sql = QueryBuilder::<Sqlite>::new(
             r#"
 WITH query_terms(term_hash, query_weight) AS (
@@ -686,16 +691,17 @@ scored_nodes AS (
     SELECT
         terms.summary_id,
         terms.node_id,
-        SUM(terms.weight * query_terms.query_weight) AS semantic_score
+        SUM(terms.weight * query_terms.query_weight) AS raw_semantic_score,
+        COUNT(DISTINCT query_terms.term_hash) AS matched_term_count
     FROM summary_node_semantic_terms AS terms
     INNER JOIN query_terms
         ON query_terms.term_hash = terms.term_hash
     GROUP BY terms.summary_id, terms.node_id
-    ORDER BY semantic_score DESC
+    ORDER BY raw_semantic_score DESC
     LIMIT
 "#,
         )
-        .push_bind(limit)
+        .push_bind(candidate_limit)
         .push(
             r#"
 )
@@ -712,22 +718,46 @@ SELECT
     NULL AS matched_file_path,
     NULL AS matched_command,
     NULL AS matched_error_text,
-    scored_nodes.semantic_score,
+    scored_nodes.raw_semantic_score AS semantic_score,
     0.0 AS lexical_score,
-    scored_nodes.semantic_score AS hybrid_score
+    scored_nodes.raw_semantic_score AS hybrid_score,
+    scored_nodes.raw_semantic_score,
+    scored_nodes.matched_term_count
 FROM scored_nodes
 INNER JOIN summary_nodes AS nodes
     ON nodes.summary_id = scored_nodes.summary_id
     AND nodes.node_id = scored_nodes.node_id
 INNER JOIN summary_artifacts AS artifacts
     ON artifacts.summary_id = scored_nodes.summary_id
-ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
+ORDER BY scored_nodes.raw_semantic_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
 "#,
         );
         let rows = sql.build().fetch_all(self.pool.as_ref()).await?;
-        rows.iter()
-            .map(summary_semantic_node_match_from_row)
-            .collect()
+        let mut matches = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut node_match = summary_semantic_node_match_from_row(row)?;
+            let raw_semantic_score: f64 = row.try_get("raw_semantic_score")?;
+            let matched_term_count: i64 = row.try_get("matched_term_count")?;
+            node_match.semantic_score = coverage_adjusted_score(
+                raw_semantic_score,
+                matched_term_count,
+                query_term_count,
+                SEMANTIC_COVERAGE_BASE_WEIGHT,
+            );
+            node_match.hybrid_score = node_match.semantic_score;
+            matches.push(node_match);
+        }
+        matches.sort_by(|left, right| {
+            right
+                .semantic_score
+                .total_cmp(&left.semantic_score)
+                .then_with(|| left.node_match.summary_id.cmp(&right.node_match.summary_id))
+                .then_with(|| left.node_match.node_id.cmp(&right.node_match.node_id))
+        });
+        if matches.len() > limit {
+            matches.truncate(limit);
+        }
+        Ok(matches)
     }
 
     async fn search_summary_nodes_by_lexical_text(
@@ -747,8 +777,10 @@ ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node
             return Ok(Vec::new());
         }
 
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let query_terms: Vec<String> = query_terms.into_iter().collect();
+        let query_term_count = query_terms.len();
+        let candidate_limit = limit.saturating_mul(4).max(limit);
+        let candidate_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
         let mut sql = QueryBuilder::<Sqlite>::new(
             r#"
 WITH query_terms(term) AS (
@@ -764,7 +796,8 @@ lexical_hits AS (
     SELECT
         file_paths.summary_id,
         file_paths.node_id,
-        0.8 AS lexical_weight
+        0.8 AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_node_file_paths AS file_paths
     INNER JOIN query_terms
         ON INSTR(LOWER(file_paths.file_path), query_terms.term) > 0
@@ -772,7 +805,16 @@ lexical_hits AS (
     SELECT
         commands.summary_id,
         commands.node_id,
-        1.0 AS lexical_weight
+        CASE
+            WHEN commands.exit_code IS NOT NULL AND commands.exit_code != 0 THEN
+    "#,
+        )
+        .push_bind(LEXICAL_COMMAND_FAILURE_WEIGHT)
+        .push(
+            r#"
+            ELSE 1.0
+        END AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_node_commands AS commands
     INNER JOIN query_terms
         ON INSTR(LOWER(commands.command), query_terms.term) > 0
@@ -780,7 +822,8 @@ lexical_hits AS (
     SELECT
         errors.summary_id,
         errors.node_id,
-        1.2 AS lexical_weight
+        1.2 AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_node_errors AS errors
     INNER JOIN query_terms
         ON INSTR(LOWER(errors.error_text), query_terms.term) > 0
@@ -788,7 +831,8 @@ lexical_hits AS (
     SELECT
         nodes.summary_id,
         nodes.node_id,
-        0.6 AS lexical_weight
+        0.6 AS lexical_weight,
+        query_terms.term AS matched_term
     FROM summary_nodes AS nodes
     INNER JOIN query_terms
         ON INSTR(LOWER(COALESCE(nodes.title, '')), query_terms.term) > 0
@@ -797,14 +841,15 @@ scored_nodes AS (
     SELECT
         summary_id,
         node_id,
-        SUM(lexical_weight) AS lexical_score
+        SUM(lexical_weight) AS raw_lexical_score,
+        COUNT(DISTINCT matched_term) AS matched_term_count
     FROM lexical_hits
     GROUP BY summary_id, node_id
-    ORDER BY lexical_score DESC
+    ORDER BY raw_lexical_score DESC
     LIMIT
 "#,
         )
-        .push_bind(limit)
+        .push_bind(candidate_limit)
         .push(
             r#"
 )
@@ -822,21 +867,45 @@ SELECT
     NULL AS matched_command,
     NULL AS matched_error_text,
     0.0 AS semantic_score,
-    scored_nodes.lexical_score,
-    scored_nodes.lexical_score AS hybrid_score
+    scored_nodes.raw_lexical_score AS lexical_score,
+    scored_nodes.raw_lexical_score AS hybrid_score,
+    scored_nodes.raw_lexical_score,
+    scored_nodes.matched_term_count
 FROM scored_nodes
 INNER JOIN summary_nodes AS nodes
     ON nodes.summary_id = scored_nodes.summary_id
     AND nodes.node_id = scored_nodes.node_id
 INNER JOIN summary_artifacts AS artifacts
     ON artifacts.summary_id = scored_nodes.summary_id
-ORDER BY scored_nodes.lexical_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
+ORDER BY scored_nodes.raw_lexical_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
 "#,
         );
         let rows = sql.build().fetch_all(self.pool.as_ref()).await?;
-        rows.iter()
-            .map(summary_semantic_node_match_from_row)
-            .collect()
+        let mut matches = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut node_match = summary_semantic_node_match_from_row(row)?;
+            let raw_lexical_score: f64 = row.try_get("raw_lexical_score")?;
+            let matched_term_count: i64 = row.try_get("matched_term_count")?;
+            node_match.lexical_score = coverage_adjusted_score(
+                raw_lexical_score,
+                matched_term_count,
+                query_term_count,
+                LEXICAL_COVERAGE_BASE_WEIGHT,
+            );
+            node_match.hybrid_score = node_match.lexical_score;
+            matches.push(node_match);
+        }
+        matches.sort_by(|left, right| {
+            right
+                .lexical_score
+                .total_cmp(&left.lexical_score)
+                .then_with(|| left.node_match.summary_id.cmp(&right.node_match.summary_id))
+                .then_with(|| left.node_match.node_id.cmp(&right.node_match.node_id))
+        });
+        if matches.len() > limit {
+            matches.truncate(limit);
+        }
+        Ok(matches)
     }
 
     async fn search_summary_nodes_by_dense_embedding(
@@ -1219,6 +1288,18 @@ fn collect_node_evidence(
 ) {
     match value {
         Value::Object(object) => {
+            if key_hint.is_some_and(is_command_key)
+                && let Some(indexed_command) = indexed_command_from_object(object)
+            {
+                commands.insert(indexed_command);
+                return;
+            }
+            if object_has_command_and_exit_code(object)
+                && let Some(indexed_command) = indexed_command_from_object(object)
+            {
+                commands.insert(indexed_command);
+                return;
+            }
             for (key, child) in object {
                 let key_lower = key.to_ascii_lowercase();
                 collect_node_evidence(
@@ -1291,10 +1372,78 @@ fn looks_like_file_path(value: &str) -> bool {
             || value.starts_with("../"))
 }
 
+fn indexed_command_from_object(object: &Map<String, Value>) -> Option<IndexedCommand> {
+    let command = string_value(
+        object,
+        &[
+            "command",
+            "cmd",
+            "primary_command",
+            "raw_command",
+            "rawCommand",
+        ],
+    )?;
+    if command.trim().is_empty() {
+        return None;
+    }
+    let exit_code = integer_value(
+        object,
+        &[
+            "exit_code",
+            "exitCode",
+            "return_code",
+            "returnCode",
+            "status_code",
+            "statusCode",
+            "code",
+        ],
+    );
+    Some(IndexedCommand { command, exit_code })
+}
+
+fn object_has_command_and_exit_code(object: &Map<String, Value>) -> bool {
+    let has_command = ["command", "cmd", "primary_command"]
+        .iter()
+        .any(|key| object.contains_key(*key));
+    let has_exit_code = [
+        "exit_code",
+        "exitCode",
+        "return_code",
+        "returnCode",
+        "status_code",
+        "statusCode",
+        "code",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    has_command && has_exit_code
+}
+
 fn string_value(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(Value::String(value)) = object.get(*key) {
             return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn integer_value(object: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            match value {
+                Value::Number(number) => {
+                    if let Some(value) = number.as_i64() {
+                        return Some(value);
+                    }
+                }
+                Value::String(value) => {
+                    if let Ok(parsed) = value.parse::<i64>() {
+                        return Some(parsed);
+                    }
+                }
+                Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => {}
+            }
         }
     }
     None
@@ -1323,6 +1472,14 @@ fn semantic_text_for_node(
     }
     for command in commands {
         text_fragments.push(command.command.clone());
+        if let Some(exit_code) = command.exit_code {
+            if exit_code == 0 {
+                text_fragments.push("command succeeded".to_string());
+            } else {
+                text_fragments.push("command failed".to_string());
+                text_fragments.push(format!("exit code {exit_code}"));
+            }
+        }
     }
     for error in errors {
         text_fragments.push(error.clone());
@@ -1373,6 +1530,15 @@ fn is_semantic_text_key(key: &str) -> bool {
             | "message"
             | "status"
             | "reason"
+            | "outcome"
+            | "result"
+            | "decision"
+            | "plan"
+            | "rationale"
+            | "next_step"
+            | "next_steps"
+            | "action"
+            | "actions"
             | "node_type"
             | "nodetype"
             | "type"
@@ -1465,6 +1631,23 @@ fn semantic_terms_from_text(text: &str) -> Vec<IndexedSemanticTerm> {
     }
     terms.sort_by(|left, right| left.term_hash.cmp(&right.term_hash));
     terms
+}
+
+fn coverage_adjusted_score(
+    raw_score: f64,
+    matched_term_count: i64,
+    query_term_count: usize,
+    coverage_base_weight: f64,
+) -> f64 {
+    if raw_score <= 0.0 || query_term_count == 0 {
+        return raw_score.max(0.0);
+    }
+    let matched_term_count = usize::try_from(matched_term_count)
+        .unwrap_or(0)
+        .min(query_term_count);
+    let coverage_ratio = (matched_term_count as f64) / (query_term_count as f64);
+    let coverage_base_weight = coverage_base_weight.clamp(0.0, 1.0);
+    raw_score * (coverage_base_weight + ((1.0 - coverage_base_weight) * coverage_ratio))
 }
 
 fn add_semantic_weight(weights_by_hash: &mut BTreeMap<i64, f64>, term_hash: i64, delta: f64) {
@@ -2010,6 +2193,105 @@ mod tests {
         assert_eq!(matches[0].node_match.node_id, "test-node");
         assert!(matches[0].hybrid_score > 0.0);
         assert!(matches.iter().any(|item| item.lexical_score > 0.0));
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn summary_index_persists_structured_command_exit_code() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+        runtime
+            .upsert_session_summary(&SessionSummaryPersistParams {
+                summary_id: None,
+                thread_id: "thread-exit-code".to_string(),
+                session_id: "session-exit-code".to_string(),
+                schema_version: "v1".to_string(),
+                root_node_id: None,
+                summary: json!({
+                    "schema_version": "v1",
+                    "nodes": [
+                        {
+                            "node_id": "cmd-node",
+                            "node_type": "execution",
+                            "title": "Run failing tests",
+                            "evidence": {
+                                "commands": [
+                                    {
+                                        "command": "cargo test -p codex-state",
+                                        "exit_code": 101
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }),
+            })
+            .await
+            .expect("upsert summary");
+
+        let row = sqlx::query(
+            "SELECT exit_code FROM summary_node_commands WHERE summary_id = ? AND node_id = ?",
+        )
+        .bind("thread-exit-code:session-exit-code")
+        .bind("cmd-node")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("query indexed command");
+        let indexed_exit_code: Option<i64> = row.try_get("exit_code").expect("read exit_code");
+        assert_eq!(indexed_exit_code, Some(101));
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn summary_semantic_search_prefers_query_term_coverage() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+        runtime
+            .upsert_session_summary(&SessionSummaryPersistParams {
+                summary_id: None,
+                thread_id: "thread-coverage".to_string(),
+                session_id: "session-coverage".to_string(),
+                schema_version: "v1".to_string(),
+                root_node_id: None,
+                summary: json!({
+                    "schema_version": "v1",
+                    "nodes": [
+                        {
+                            "node_id": "cargo-spam",
+                            "node_type": "execution",
+                            "title": "cargo cargo cargo cargo",
+                            "summary": "cargo cargo cargo cargo",
+                            "evidence": {
+                                "commands": [{"command": "cargo"}]
+                            }
+                        },
+                        {
+                            "node_id": "focused-node",
+                            "node_type": "execution",
+                            "title": "Run codex state tests",
+                            "summary": "Run cargo test for codex state indexing",
+                            "evidence": {
+                                "commands": [{"command": "cargo test -p codex-state"}]
+                            }
+                        }
+                    ]
+                }),
+            })
+            .await
+            .expect("upsert summary");
+
+        let matches = runtime
+            .search_summary_nodes_by_semantic_text("cargo test codex state", 5)
+            .await
+            .expect("semantic search should succeed");
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].node_match.node_id, "focused-node");
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
