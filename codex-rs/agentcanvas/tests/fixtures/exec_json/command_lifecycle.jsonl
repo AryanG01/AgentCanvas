@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"test-thread-002"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"echo 'test'","status":"in_progress","aggregated_output":"","exit_code":null}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"echo 'test'","status":"completed","aggregated_output":"test\n","exit_code":0}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":60,"output_tokens":30}}
