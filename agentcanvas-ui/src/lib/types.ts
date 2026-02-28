@@ -106,6 +106,7 @@ export interface GraphNodeData {
   collapsed?: boolean
   itemCount?: number  // number of child items (for turn nodes)
   aggregatedCommands?: CommandExecutionEvent[]  // for command summary nodes
+  [key: string]: unknown  // Index signature for @xyflow/react compatibility
 }
 
 // ---------------------------------------------------------------------------

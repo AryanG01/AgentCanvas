@@ -13,6 +13,7 @@ interface GraphState {
   searchQuery: string
   wsStatus: WsStatus
   wsUrl: string
+  jsonlWsUrl: string
   sessions: SessionInfo[]
   selectedSessionFile: string | null
   expandedTurns: Set<string>
@@ -23,6 +24,7 @@ interface GraphState {
   setSearch: (q: string) => void
   setWsStatus: (s: WsStatus) => void
   setWsUrl: (url: string) => void
+  setJsonlWsUrl: (url: string) => void
   fetchSessions: () => Promise<void>
   selectSession: (file: string) => void
   toggleTurn: (turnId: string) => void
@@ -31,6 +33,7 @@ interface GraphState {
 
 const REPLAY_API = import.meta.env.VITE_REPLAY_API ?? '/api/sessions'
 const BASE_WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:5173/ws'
+const BASE_JSONL_WS_URL = import.meta.env.VITE_JSONL_WS_URL ?? 'ws://localhost:3737'
 
 const initialState = {
   events: [] as AppEvent[],
@@ -41,6 +44,7 @@ const initialState = {
   searchQuery: '',
   wsStatus: 'disconnected' as WsStatus,
   wsUrl: '',  // empty = don't connect until a session is selected
+  jsonlWsUrl: BASE_JSONL_WS_URL,  // JSONL WebSocket URL for codex-tui
   sessions: [] as SessionInfo[],
   selectedSessionFile: null as string | null,
   expandedTurns: new Set<string>(),
@@ -94,6 +98,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   setSearch: (q) => set({ searchQuery: q }),
   setWsStatus: (s) => set({ wsStatus: s }),
   setWsUrl: (url) => set({ wsUrl: url }),
+  setJsonlWsUrl: (url) => set({ jsonlWsUrl: url }),
 
   fetchSessions: async () => {
     try {

@@ -6,15 +6,23 @@ import { SearchBar } from './components/SearchBar'
 import { SessionPicker } from './components/SessionPicker'
 import { ConnectPanel } from './components/ConnectPanel'
 import { useAppServerWS } from './hooks/useAppServerWS'
+import { useCodexJsonlWS } from './hooks/useCodexJsonlWS'
 import { useGraphStore } from './store/graphStore'
 import { MOCK_EVENTS } from './lib/mockEvents'
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
+const USE_JSONL = import.meta.env.VITE_USE_JSONL !== 'false'
 
 function AppInner() {
   const addEvent = useGraphStore(s => s.addEvent)
   const nodes = useGraphStore(s => s.nodes)
-  useAppServerWS()
+
+  // Use JSONL hook or app-server hook based on env var
+  if (USE_JSONL) {
+    useCodexJsonlWS()
+  } else {
+    useAppServerWS()
+  }
 
   useEffect(() => {
     if (!USE_MOCK) return
