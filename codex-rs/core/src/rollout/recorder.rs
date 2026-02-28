@@ -1,5 +1,6 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Error as IoError;
@@ -10,6 +11,8 @@ use chrono::SecondsFormat;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -54,6 +57,8 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_state::SessionSummaryPersistParams;
 use codex_state::StateRuntime;
 use codex_state::ThreadMetadataBuilder;
 
@@ -132,6 +137,523 @@ impl RolloutRecorderParams {
 }
 
 const PERSISTED_EXEC_AGGREGATED_OUTPUT_MAX_BYTES: usize = 10_000;
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
+struct AgentCanvasCommandEvidence {
+    command: String,
+    exit_code: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAgentCanvasTurnSummary {
+    turn_id: String,
+    parent_turn_id: Option<String>,
+    started_after_rollback: bool,
+    commands: BTreeSet<AgentCanvasCommandEvidence>,
+    file_paths: BTreeSet<String>,
+    errors: BTreeSet<String>,
+}
+
+impl PendingAgentCanvasTurnSummary {
+    fn new(turn_id: String, parent_turn_id: Option<String>, started_after_rollback: bool) -> Self {
+        Self {
+            turn_id,
+            parent_turn_id,
+            started_after_rollback,
+            commands: BTreeSet::new(),
+            file_paths: BTreeSet::new(),
+            errors: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompletedAgentCanvasTurnSummary {
+    turn_id: String,
+    status: String,
+    parent_turn_id: Option<String>,
+    forked_from_thread_id: Option<String>,
+    started_after_rollback: bool,
+    last_agent_message: Option<String>,
+    commands: Vec<AgentCanvasCommandEvidence>,
+    file_paths: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct AgentCanvasSummaryUpdates {
+    completed_turn_summaries: Vec<CompletedAgentCanvasTurnSummary>,
+    rolled_back_turn_ids: Vec<String>,
+}
+
+impl AgentCanvasSummaryUpdates {
+    fn append(&mut self, mut other: Self) {
+        self.completed_turn_summaries
+            .append(&mut other.completed_turn_summaries);
+        self.rolled_back_turn_ids
+            .append(&mut other.rolled_back_turn_ids);
+    }
+}
+
+#[derive(Default)]
+struct AgentCanvasSummaryAccumulator {
+    thread_id: Option<String>,
+    forked_from_thread_id: Option<String>,
+    pending_turn: Option<PendingAgentCanvasTurnSummary>,
+    active_turn_lineage: Vec<String>,
+    rollback_since_last_turn: bool,
+}
+
+impl AgentCanvasSummaryAccumulator {
+    fn update_thread_id(&mut self, builder: Option<&ThreadMetadataBuilder>, rollout_path: &Path) {
+        if self.thread_id.is_none()
+            && let Some(builder) = builder
+        {
+            self.thread_id = Some(builder.id.to_string());
+        }
+        if self.thread_id.is_none()
+            && let Some(file_name) = rollout_path.file_name().and_then(|name| name.to_str())
+            && let Some((_timestamp, id)) = parse_timestamp_uuid_from_filename(file_name)
+        {
+            self.thread_id = Some(id.to_string());
+        }
+    }
+
+    fn observe_session_meta(&mut self, meta_line: &SessionMetaLine) {
+        if self.thread_id.is_none() {
+            self.thread_id = Some(meta_line.meta.id.to_string());
+        }
+        if self.forked_from_thread_id.is_none()
+            && let Some(forked_from_id) = meta_line.meta.forked_from_id.as_ref()
+        {
+            self.forked_from_thread_id = Some(forked_from_id.to_string());
+        }
+    }
+
+    fn handle_rollout_items(&mut self, items: &[RolloutItem]) -> AgentCanvasSummaryUpdates {
+        let mut updates = AgentCanvasSummaryUpdates::default();
+        for item in items {
+            updates.append(self.handle_rollout_item(item));
+        }
+        updates
+    }
+
+    fn handle_rollout_item(&mut self, item: &RolloutItem) -> AgentCanvasSummaryUpdates {
+        match item {
+            RolloutItem::EventMsg(event) => self.handle_event(event),
+            RolloutItem::ResponseItem(item) => {
+                self.handle_response_item(item);
+                AgentCanvasSummaryUpdates::default()
+            }
+            RolloutItem::SessionMeta(meta_line) => {
+                self.observe_session_meta(meta_line);
+                AgentCanvasSummaryUpdates::default()
+            }
+            RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) => {
+                AgentCanvasSummaryUpdates::default()
+            }
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &codex_protocol::protocol::EventMsg,
+    ) -> AgentCanvasSummaryUpdates {
+        let mut updates = AgentCanvasSummaryUpdates::default();
+        match event {
+            codex_protocol::protocol::EventMsg::TurnStarted(event) => {
+                let parent_turn_id = self.active_turn_lineage.last().cloned();
+                self.pending_turn = Some(PendingAgentCanvasTurnSummary::new(
+                    event.turn_id.clone(),
+                    parent_turn_id,
+                    self.rollback_since_last_turn,
+                ));
+                self.rollback_since_last_turn = false;
+            }
+            codex_protocol::protocol::EventMsg::TurnComplete(event) => {
+                let completed = self.complete_turn_summary(
+                    event.turn_id.as_str(),
+                    "completed",
+                    event.last_agent_message.clone(),
+                );
+                self.push_active_turn(completed.turn_id.clone());
+                updates.completed_turn_summaries.push(completed);
+            }
+            codex_protocol::protocol::EventMsg::TurnAborted(event) => {
+                let Some(turn_id) = event.turn_id.clone().or_else(|| {
+                    self.pending_turn
+                        .as_ref()
+                        .map(|pending| pending.turn_id.clone())
+                }) else {
+                    return updates;
+                };
+                let status = match event.reason {
+                    TurnAbortReason::Interrupted => "interrupted",
+                    TurnAbortReason::Replaced => "replaced",
+                    TurnAbortReason::ReviewEnded => "review_ended",
+                };
+                updates
+                    .completed_turn_summaries
+                    .push(self.complete_turn_summary(turn_id.as_str(), status, None));
+            }
+            codex_protocol::protocol::EventMsg::ThreadRolledBack(event) => {
+                updates.rolled_back_turn_ids = self.rollback_active_turns(event.num_turns);
+                if !updates.rolled_back_turn_ids.is_empty() {
+                    self.rollback_since_last_turn = true;
+                }
+            }
+            codex_protocol::protocol::EventMsg::ExecCommandEnd(event) => {
+                let turn_id = if event.turn_id.is_empty() {
+                    None
+                } else {
+                    Some(event.turn_id.as_str())
+                };
+                if let Some(pending) = self.pending_turn_for(turn_id) {
+                    pending.commands.insert(AgentCanvasCommandEvidence {
+                        command: event.command.join(" "),
+                        exit_code: Some(i64::from(event.exit_code)),
+                    });
+                    if event.exit_code != 0
+                        || !matches!(
+                            event.status,
+                            codex_protocol::protocol::ExecCommandStatus::Completed
+                        )
+                    {
+                        if !event.stderr.trim().is_empty() {
+                            pending.errors.insert(event.stderr.trim().to_string());
+                        } else if !event.aggregated_output.trim().is_empty() {
+                            pending
+                                .errors
+                                .insert(event.aggregated_output.trim().to_string());
+                        }
+                    }
+                }
+            }
+            codex_protocol::protocol::EventMsg::PatchApplyEnd(event) => {
+                let turn_id = if event.turn_id.is_empty() {
+                    None
+                } else {
+                    Some(event.turn_id.as_str())
+                };
+                if let Some(pending) = self.pending_turn_for(turn_id) {
+                    for path in event.changes.keys() {
+                        pending
+                            .file_paths
+                            .insert(path.to_string_lossy().into_owned());
+                    }
+                    if !event.success {
+                        if !event.stderr.trim().is_empty() {
+                            pending.errors.insert(event.stderr.trim().to_string());
+                        } else if !event.stdout.trim().is_empty() {
+                            pending.errors.insert(event.stdout.trim().to_string());
+                        }
+                    }
+                }
+            }
+            codex_protocol::protocol::EventMsg::Error(event) => {
+                if let Some(pending) = self.pending_turn_for(None) {
+                    pending.errors.insert(event.message.clone());
+                }
+            }
+            codex_protocol::protocol::EventMsg::ViewImageToolCall(event) => {
+                if let Some(pending) = self.pending_turn_for(None) {
+                    pending
+                        .file_paths
+                        .insert(event.path.to_string_lossy().into_owned());
+                }
+            }
+            _ => {}
+        }
+        updates
+    }
+
+    fn handle_response_item(&mut self, item: &ResponseItem) {
+        let Some(pending) = self.pending_turn_for(None) else {
+            return;
+        };
+        match item {
+            ResponseItem::LocalShellCall { action, .. } => {
+                let LocalShellAction::Exec(exec) = action;
+                pending.commands.insert(AgentCanvasCommandEvidence {
+                    command: exec.command.join(" "),
+                    exit_code: None,
+                });
+            }
+            ResponseItem::FunctionCall {
+                name, arguments, ..
+            } => {
+                collect_apply_patch_paths(
+                    name.as_str(),
+                    arguments.as_str(),
+                    &mut pending.file_paths,
+                );
+                if let Some(command) = extract_command_from_json(arguments.as_str()) {
+                    pending.commands.insert(AgentCanvasCommandEvidence {
+                        command,
+                        exit_code: None,
+                    });
+                }
+            }
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                if output.success == Some(false)
+                    && let Some(text) = output.body.to_text()
+                {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        pending.errors.insert(trimmed.to_string());
+                    }
+                }
+            }
+            ResponseItem::CustomToolCall { name, input, .. } => {
+                collect_apply_patch_paths(name.as_str(), input.as_str(), &mut pending.file_paths);
+                if let Some(command) = extract_command_from_json(input.as_str()) {
+                    pending.commands.insert(AgentCanvasCommandEvidence {
+                        command,
+                        exit_code: None,
+                    });
+                }
+            }
+            ResponseItem::Message { .. }
+            | ResponseItem::Reasoning { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::Other => {}
+        }
+    }
+
+    fn pending_turn_for(
+        &mut self,
+        turn_id: Option<&str>,
+    ) -> Option<&mut PendingAgentCanvasTurnSummary> {
+        match (self.pending_turn.as_ref(), turn_id) {
+            (Some(pending), Some(turn_id)) if pending.turn_id != turn_id => None,
+            _ => self.pending_turn.as_mut(),
+        }
+    }
+
+    fn complete_turn_summary(
+        &mut self,
+        turn_id: &str,
+        status: &str,
+        last_agent_message: Option<String>,
+    ) -> CompletedAgentCanvasTurnSummary {
+        let pending_turn = match self.pending_turn.take() {
+            Some(pending_turn) if pending_turn.turn_id == turn_id => pending_turn,
+            Some(pending_turn) => {
+                self.pending_turn = Some(pending_turn);
+                PendingAgentCanvasTurnSummary::new(
+                    turn_id.to_string(),
+                    self.active_turn_lineage.last().cloned(),
+                    false,
+                )
+            }
+            None => PendingAgentCanvasTurnSummary::new(
+                turn_id.to_string(),
+                self.active_turn_lineage.last().cloned(),
+                false,
+            ),
+        };
+        CompletedAgentCanvasTurnSummary {
+            turn_id: turn_id.to_string(),
+            status: status.to_string(),
+            parent_turn_id: pending_turn.parent_turn_id,
+            forked_from_thread_id: self.forked_from_thread_id.clone(),
+            started_after_rollback: pending_turn.started_after_rollback,
+            last_agent_message,
+            commands: pending_turn.commands.into_iter().collect(),
+            file_paths: pending_turn.file_paths.into_iter().collect(),
+            errors: pending_turn.errors.into_iter().collect(),
+        }
+    }
+
+    fn push_active_turn(&mut self, turn_id: String) {
+        self.active_turn_lineage.retain(|id| id != turn_id.as_str());
+        self.active_turn_lineage.push(turn_id);
+    }
+
+    fn rollback_active_turns(&mut self, num_turns: u32) -> Vec<String> {
+        let mut rolled_back_turn_ids = Vec::new();
+        for _ in 0..num_turns {
+            let Some(turn_id) = self.active_turn_lineage.pop() else {
+                break;
+            };
+            rolled_back_turn_ids.push(turn_id);
+        }
+        rolled_back_turn_ids
+    }
+}
+
+fn collect_apply_patch_paths(name: &str, input: &str, file_paths: &mut BTreeSet<String>) {
+    if name != "apply_patch" {
+        return;
+    }
+    for line in input.lines() {
+        for prefix in [
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ] {
+            if let Some(path) = line.strip_prefix(prefix) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    file_paths.insert(path.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn extract_command_from_json(input: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(input).ok()?;
+    if let Some(command) = value.get("command").and_then(Value::as_str) {
+        return Some(command.to_string());
+    }
+    if let Some(command) = value.get("cmd").and_then(Value::as_str) {
+        return Some(command.to_string());
+    }
+    None
+}
+
+async fn persist_agentcanvas_turn_summaries(
+    state_db_ctx: Option<&StateRuntime>,
+    accumulator: &AgentCanvasSummaryAccumulator,
+    summary_updates: AgentCanvasSummaryUpdates,
+) {
+    let (Some(state_db_ctx), Some(thread_id)) = (state_db_ctx, accumulator.thread_id.as_deref())
+    else {
+        return;
+    };
+
+    for turn_summary in summary_updates.completed_turn_summaries {
+        let CompletedAgentCanvasTurnSummary {
+            turn_id,
+            status,
+            parent_turn_id,
+            forked_from_thread_id,
+            started_after_rollback,
+            last_agent_message,
+            commands,
+            file_paths,
+            errors,
+        } = turn_summary;
+        let node_id = format!("turn:{turn_id}");
+        let parent_node_id = parent_turn_id
+            .as_ref()
+            .map(|parent_turn_id| format!("turn:{parent_turn_id}"));
+        let summary = serde_json::json!({
+            "schema_version": "agentcanvas.turn.v1",
+            "thread_id": thread_id,
+            "session_id": turn_id.clone(),
+            "forked_from_thread_id": forked_from_thread_id.clone(),
+            "node_type": "session",
+            "nodes": [
+                {
+                    "node_id": node_id,
+                    "parent_id": parent_node_id,
+                    "node_type": "turn",
+                    "title": format!("Turn {turn_id}"),
+                    "summary": last_agent_message,
+                    "status": status,
+                    "lineage": {
+                        "parent_turn_id": parent_turn_id,
+                        "forked_from_thread_id": forked_from_thread_id,
+                        "started_after_rollback": started_after_rollback,
+                    },
+                    "evidence": {
+                        "file_paths": file_paths,
+                        "commands": commands,
+                        "errors": errors,
+                    }
+                }
+            ]
+        });
+        let params = SessionSummaryPersistParams {
+            summary_id: Some(format!("agentcanvas.turn:{thread_id}:{turn_id}")),
+            thread_id: thread_id.to_string(),
+            session_id: turn_id.clone(),
+            schema_version: "agentcanvas.turn.v1".to_string(),
+            root_node_id: Some(node_id),
+            summary,
+        };
+        if let Err(err) = state_db_ctx.upsert_session_summary(&params).await {
+            warn!(
+                "failed to persist agentcanvas turn summary for thread {} turn {}: {err}",
+                thread_id, turn_id
+            );
+        }
+    }
+
+    for turn_id in summary_updates.rolled_back_turn_ids {
+        let Ok(Some(mut summary)) = state_db_ctx
+            .read_session_summary_by_thread_and_session(thread_id, turn_id.as_str())
+            .await
+        else {
+            continue;
+        };
+        let node_id = format!("turn:{turn_id}");
+        let mut updated = false;
+        if let Some(nodes) = summary.get_mut("nodes").and_then(Value::as_array_mut) {
+            for node in nodes {
+                let matches_node = node
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == node_id);
+                if !matches_node {
+                    continue;
+                }
+                let Some(node_object) = node.as_object_mut() else {
+                    continue;
+                };
+                node_object.insert(
+                    "status".to_string(),
+                    Value::String("rolled_back".to_string()),
+                );
+                if !matches!(node_object.get("lineage"), Some(Value::Object(_))) {
+                    node_object.insert("lineage".to_string(), serde_json::json!({}));
+                }
+                if let Some(lineage) = node_object
+                    .get_mut("lineage")
+                    .and_then(Value::as_object_mut)
+                {
+                    lineage.insert("was_rolled_back".to_string(), Value::Bool(true));
+                }
+                updated = true;
+            }
+        }
+        if !updated {
+            continue;
+        }
+
+        let root_node_id = summary
+            .get("nodes")
+            .and_then(Value::as_array)
+            .and_then(|nodes| nodes.first())
+            .and_then(|node| node.get("node_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let params = SessionSummaryPersistParams {
+            summary_id: Some(format!("agentcanvas.turn:{thread_id}:{turn_id}")),
+            thread_id: thread_id.to_string(),
+            session_id: turn_id.clone(),
+            schema_version: summary
+                .get("schema_version")
+                .and_then(Value::as_str)
+                .unwrap_or("agentcanvas.turn.v1")
+                .to_string(),
+            root_node_id,
+            summary,
+        };
+        if let Err(err) = state_db_ctx.upsert_session_summary(&params).await {
+            warn!(
+                "failed to mark agentcanvas turn summary rolled back for thread {} turn {}: {err}",
+                thread_id, turn_id
+            );
+        }
+    }
+}
 
 fn sanitize_rollout_item_for_persistence(
     item: RolloutItem,
@@ -716,9 +1238,12 @@ async fn rollout_writer(
 ) -> std::io::Result<()> {
     let mut writer = file.map(|file| JsonlWriter { file });
     let mut buffered_items = Vec::<RolloutItem>::new();
+    let mut agentcanvas_summary_accumulator = AgentCanvasSummaryAccumulator::default();
     if let Some(builder) = state_builder.as_mut() {
         builder.rollout_path = rollout_path.clone();
     }
+    agentcanvas_summary_accumulator
+        .update_thread_id(state_builder.as_ref(), rollout_path.as_path());
 
     // Resumed sessions already have a file handle open, so session metadata can
     // be written immediately if present.
@@ -736,6 +1261,8 @@ async fn rollout_writer(
             generate_memories,
         )
         .await?;
+        agentcanvas_summary_accumulator
+            .update_thread_id(state_builder.as_ref(), rollout_path.as_path());
     }
 
     // Process rollout commands
@@ -762,6 +1289,7 @@ async fn rollout_writer(
                     state_db_ctx.as_deref(),
                     &mut state_builder,
                     default_provider.as_str(),
+                    &mut agentcanvas_summary_accumulator,
                 )
                 .await?;
             }
@@ -790,6 +1318,8 @@ async fn rollout_writer(
                                 generate_memories,
                             )
                             .await?;
+                            agentcanvas_summary_accumulator
+                                .update_thread_id(state_builder.as_ref(), rollout_path.as_path());
                         }
 
                         if !buffered_items.is_empty() {
@@ -800,6 +1330,7 @@ async fn rollout_writer(
                                 state_db_ctx.as_deref(),
                                 &mut state_builder,
                                 default_provider.as_str(),
+                                &mut agentcanvas_summary_accumulator,
                             )
                             .await?;
                             buffered_items.clear();
@@ -879,6 +1410,7 @@ async fn write_and_reconcile_items(
     state_db_ctx: Option<&StateRuntime>,
     state_builder: &mut Option<ThreadMetadataBuilder>,
     default_provider: &str,
+    agentcanvas_summary_accumulator: &mut AgentCanvasSummaryAccumulator,
 ) -> std::io::Result<()> {
     if let Some(writer) = writer.as_mut() {
         for item in items {
@@ -896,6 +1428,14 @@ async fn write_and_reconcile_items(
         items,
         "rollout_writer",
         None,
+    )
+    .await;
+    agentcanvas_summary_accumulator.update_thread_id(state_builder.as_ref(), rollout_path);
+    let summary_updates = agentcanvas_summary_accumulator.handle_rollout_items(items);
+    persist_agentcanvas_turn_summaries(
+        state_db_ctx,
+        agentcanvas_summary_accumulator,
+        summary_updates,
     )
     .await;
     Ok(())
@@ -1065,11 +1605,20 @@ mod tests {
     use crate::features::Feature;
     use chrono::TimeZone;
     use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+    use codex_protocol::models::LocalShellAction;
+    use codex_protocol::models::LocalShellExecAction;
+    use codex_protocol::models::LocalShellStatus;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
+    use codex_protocol::protocol::ThreadRolledBackEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnContextItem;
+    use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use std::fs::File;
@@ -1110,6 +1659,21 @@ mod tests {
         });
         writeln!(file, "{user_event}")?;
         Ok(path)
+    }
+
+    fn turn_started_item(turn_id: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }))
+    }
+
+    fn turn_complete_item(turn_id: &str, last_agent_message: Option<&str>) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn_id.to_string(),
+            last_agent_message: last_agent_message.map(ToOwned::to_owned),
+        }))
     }
 
     #[tokio::test]
@@ -1421,6 +1985,297 @@ mod tests {
             )
             .await
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorder_persists_agentcanvas_turn_summary_on_turn_complete() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.features.enable(Feature::Sqlite);
+
+        let state_db = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await
+        .expect("state db should initialize");
+
+        let thread_id = ThreadId::new();
+        let turn_id = "turn-1".to_string();
+        let recorder = RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::new(
+                thread_id,
+                None,
+                SessionSource::Cli,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            Some(state_db.clone()),
+            None,
+        )
+        .await?;
+
+        recorder
+            .record_items(&[
+                turn_started_item(turn_id.as_str()),
+                RolloutItem::ResponseItem(ResponseItem::LocalShellCall {
+                    id: None,
+                    call_id: Some("call-1".to_string()),
+                    status: LocalShellStatus::Completed,
+                    action: LocalShellAction::Exec(LocalShellExecAction {
+                        command: vec!["rg".to_string(), "summary".to_string()],
+                        timeout_ms: None,
+                        working_directory: None,
+                        env: None,
+                        user: None,
+                    }),
+                }),
+                RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
+                    message: "boom".to_string(),
+                    codex_error_info: None,
+                })),
+                turn_complete_item(turn_id.as_str(), Some("completed")),
+            ])
+            .await?;
+
+        recorder.persist().await?;
+        recorder.flush().await?;
+
+        let thread_id_str = thread_id.to_string();
+        let artifact = state_db
+            .get_session_summary_by_thread_and_session(thread_id_str.as_str(), turn_id.as_str())
+            .await
+            .expect("summary lookup should succeed")
+            .expect("summary should be persisted");
+        assert_eq!(artifact.root_node_id, Some(format!("turn:{turn_id}")));
+
+        let summary = state_db
+            .read_session_summary_by_thread_and_session(thread_id_str.as_str(), turn_id.as_str())
+            .await
+            .expect("summary read should succeed")
+            .expect("summary payload should exist");
+        assert_eq!(
+            summary["schema_version"],
+            serde_json::json!("agentcanvas.turn.v1")
+        );
+        assert_eq!(
+            summary["thread_id"],
+            serde_json::json!(thread_id_str.clone())
+        );
+        assert_eq!(summary["session_id"], serde_json::json!(turn_id.clone()));
+        assert_eq!(
+            summary["nodes"][0]["evidence"]["commands"][0]["command"],
+            serde_json::json!("rg summary")
+        );
+        assert_eq!(
+            summary["nodes"][0]["evidence"]["errors"][0],
+            serde_json::json!("boom")
+        );
+
+        let command_matches = state_db
+            .search_summary_nodes_by_command_substring("rg summary", 10)
+            .await
+            .expect("command search should succeed");
+        assert_eq!(command_matches.len(), 1);
+        assert_eq!(command_matches[0].thread_id, thread_id_str);
+        assert_eq!(command_matches[0].session_id, turn_id);
+
+        recorder.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorder_persists_turn_lineage_for_forked_threads() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.features.enable(Feature::Sqlite);
+
+        let state_db = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await
+        .expect("state db should initialize");
+
+        let thread_id = ThreadId::new();
+        let forked_from_thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::new(
+                thread_id.clone(),
+                None,
+                SessionSource::Cli,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            Some(state_db.clone()),
+            None,
+        )
+        .await?;
+
+        recorder
+            .record_items(&[
+                RolloutItem::SessionMeta(SessionMetaLine {
+                    meta: SessionMeta {
+                        id: thread_id.clone(),
+                        forked_from_id: Some(forked_from_thread_id.clone()),
+                        timestamp: "2026-02-28T00:00:00Z".to_string(),
+                        cwd: home.path().to_path_buf(),
+                        originator: "test_originator".to_string(),
+                        cli_version: "test_version".to_string(),
+                        source: SessionSource::Cli,
+                        agent_nickname: None,
+                        agent_role: None,
+                        model_provider: Some(config.model_provider_id.clone()),
+                        base_instructions: None,
+                        dynamic_tools: None,
+                    },
+                    git: None,
+                }),
+                turn_started_item("turn-1"),
+                turn_complete_item("turn-1", Some("completed-1")),
+                turn_started_item("turn-2"),
+                turn_complete_item("turn-2", Some("completed-2")),
+            ])
+            .await?;
+
+        recorder.persist().await?;
+        recorder.flush().await?;
+
+        let thread_id_str = thread_id.to_string();
+        let forked_from_thread_id_str = forked_from_thread_id.to_string();
+        let turn_1_summary = state_db
+            .read_session_summary_by_thread_and_session(thread_id_str.as_str(), "turn-1")
+            .await
+            .expect("turn-1 summary read should succeed")
+            .expect("turn-1 summary should be present");
+        assert_eq!(
+            turn_1_summary["nodes"][0]["parent_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            turn_1_summary["nodes"][0]["lineage"]["forked_from_thread_id"],
+            serde_json::json!(forked_from_thread_id_str.clone())
+        );
+
+        let turn_2_summary = state_db
+            .read_session_summary_by_thread_and_session(thread_id_str.as_str(), "turn-2")
+            .await
+            .expect("turn-2 summary read should succeed")
+            .expect("turn-2 summary should be present");
+        assert_eq!(
+            turn_2_summary["nodes"][0]["parent_id"],
+            serde_json::json!("turn:turn-1")
+        );
+        assert_eq!(
+            turn_2_summary["nodes"][0]["lineage"]["parent_turn_id"],
+            serde_json::json!("turn-1")
+        );
+        assert_eq!(
+            turn_2_summary["nodes"][0]["lineage"]["forked_from_thread_id"],
+            serde_json::json!(forked_from_thread_id_str)
+        );
+
+        recorder.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorder_tracks_backtracking_after_thread_rollback() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.features.enable(Feature::Sqlite);
+
+        let state_db = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await
+        .expect("state db should initialize");
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::new(
+                thread_id.clone(),
+                None,
+                SessionSource::Cli,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            Some(state_db.clone()),
+            None,
+        )
+        .await?;
+
+        recorder
+            .record_items(&[
+                turn_started_item("turn-a"),
+                turn_complete_item("turn-a", Some("completed-a")),
+                turn_started_item("turn-b"),
+                turn_complete_item("turn-b", Some("completed-b")),
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                    num_turns: 1,
+                })),
+                turn_started_item("turn-c"),
+                turn_complete_item("turn-c", Some("completed-c")),
+            ])
+            .await?;
+
+        recorder.persist().await?;
+        recorder.flush().await?;
+
+        let thread_id_str = thread_id.to_string();
+        let turn_b_summary = state_db
+            .read_session_summary_by_thread_and_session(thread_id_str.as_str(), "turn-b")
+            .await
+            .expect("turn-b summary read should succeed")
+            .expect("turn-b summary should be present");
+        assert_eq!(
+            turn_b_summary["nodes"][0]["status"],
+            serde_json::json!("rolled_back")
+        );
+        assert_eq!(
+            turn_b_summary["nodes"][0]["lineage"]["was_rolled_back"],
+            serde_json::json!(true)
+        );
+
+        let turn_c_summary = state_db
+            .read_session_summary_by_thread_and_session(thread_id_str.as_str(), "turn-c")
+            .await
+            .expect("turn-c summary read should succeed")
+            .expect("turn-c summary should be present");
+        assert_eq!(
+            turn_c_summary["nodes"][0]["parent_id"],
+            serde_json::json!("turn:turn-a")
+        );
+        assert_eq!(
+            turn_c_summary["nodes"][0]["lineage"]["parent_turn_id"],
+            serde_json::json!("turn-a")
+        );
+        assert_eq!(
+            turn_c_summary["nodes"][0]["lineage"]["started_after_rollback"],
+            serde_json::json!(true)
+        );
+
+        recorder.shutdown().await?;
         Ok(())
     }
 }
