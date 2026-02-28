@@ -1377,6 +1377,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-exec",
  "codex-protocol",
+ "codex-utils-cargo-bin",
  "futures",
  "insta",
  "pretty_assertions",
