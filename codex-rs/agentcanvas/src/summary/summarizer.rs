@@ -170,6 +170,7 @@ impl SessionSummarizer {
             let parent_turn_id = index
                 .checked_sub(1)
                 .and_then(|previous_index| ordered_turn_ids.get(previous_index).cloned());
+            let child_turn_id = ordered_turn_ids.get(index + 1).cloned();
 
             let turn_node_id = format!("turn:{turn_id}");
             let turn_summary = turn.last_agent_message.clone().or_else(|| {
@@ -181,6 +182,11 @@ impl SessionSummarizer {
                     )
                 })
             });
+            let turn_summary = summarize_turn_with_context(
+                turn_summary,
+                parent_turn_id.as_deref(),
+                child_turn_id.as_deref(),
+            );
 
             nodes.push(SummaryNode {
                 node_id: turn_node_id.clone(),
@@ -423,6 +429,30 @@ impl SessionSummarizer {
                 started_at: Some(timestamp),
                 ..Default::default()
             })
+    }
+}
+
+fn summarize_turn_with_context(
+    summary: Option<String>,
+    parent_turn_id: Option<&str>,
+    child_turn_id: Option<&str>,
+) -> Option<String> {
+    if parent_turn_id.is_none() && child_turn_id.is_none() {
+        return summary;
+    }
+
+    let mut context_parts = Vec::new();
+    if let Some(parent_turn_id) = parent_turn_id {
+        context_parts.push(format!("parent={parent_turn_id}"));
+    }
+    if let Some(child_turn_id) = child_turn_id {
+        context_parts.push(format!("child={child_turn_id}"));
+    }
+    let context = context_parts.join(" ");
+
+    match summary {
+        Some(summary) => Some(format!("{summary} [{context}]")),
+        None => Some(context),
     }
 }
 
