@@ -55,6 +55,19 @@ let defaultRolloutPath = args.find(
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const SUMMARY_DIR = join(homedir(), ".codex", "agentcanvas", "summaries");
 const MAX_SYNTHETIC_SUMMARY_CHARS = 400;
+const SUMMARY_LLM_MODEL = "gpt-4.1-nano";
+const SUMMARY_LLM_MAX_TOKENS = 2048;
+const SUMMARY_LLM_TIMEOUT_MS = 15_000;
+
+const SUMMARY_SYSTEM_PROMPT = `\
+You are generating high-signal hierarchical summaries for coding-agent turns.
+Each input object includes direct turn evidence plus parent/child snapshots.
+For each turn summary, use this exact format:
+Outcome: <primary result>. Evidence: <key commands/files/errors>. Lineage: <parent/child/fork/rollback context>.
+Keep summaries concise and concrete (1-3 short sentences), do not invent facts, and
+prioritize failures or behavior changes before generic status text.
+Return a JSON array where each item has fields \`turn_id\` and \`summary\`.
+Return ONLY JSON, no markdown fences, no extra text.`;
 
 function sanitizePathComponent(value) {
   return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
@@ -280,6 +293,252 @@ function parseOutputJson(outputStr) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-turn evidence collection & LLM summarization
+// ---------------------------------------------------------------------------
+
+/** Collects commands, file paths, errors, and agent messages per turn. */
+class TurnEvidenceCollector {
+  constructor() {
+    /** @type {Map<string, {commands: string[], filePaths: string[], errors: string[], agentMessage: string|null, status: string, parentTurnId: string|null}>} */
+    this.byTurn = new Map();
+  }
+
+  _ensure(turnId) {
+    if (!this.byTurn.has(turnId)) {
+      this.byTurn.set(turnId, {
+        commands: [],
+        filePaths: [],
+        errors: [],
+        agentMessage: null,
+        status: "completed",
+        parentTurnId: null,
+      });
+    }
+    return this.byTurn.get(turnId);
+  }
+
+  addCommand(turnId, cmd, exitCode) {
+    const t = this._ensure(turnId);
+    t.commands.push(cmd);
+    if (exitCode !== 0 && exitCode !== null) {
+      t.errors.push(`${cmd} (exit ${exitCode})`);
+    }
+  }
+
+  addFilePath(turnId, path) {
+    const t = this._ensure(turnId);
+    if (!t.filePaths.includes(path)) t.filePaths.push(path);
+  }
+
+  setAgentMessage(turnId, msg) {
+    const t = this._ensure(turnId);
+    t.agentMessage = msg;
+  }
+
+  setStatus(turnId, status) {
+    const t = this._ensure(turnId);
+    t.status = status;
+  }
+
+  setParentTurnId(turnId, parentTurnId) {
+    const t = this._ensure(turnId);
+    t.parentTurnId = parentTurnId;
+  }
+}
+
+function computeSignal(evidence) {
+  if (evidence.errors.length > 0) return "error";
+  if (evidence.filePaths.length > 0) return "code_changes";
+  if (evidence.commands.length > 0) return "execution";
+  return "status_only";
+}
+
+function buildCompactSummary(turnId, evidence) {
+  const { commands, filePaths, errors, agentMessage, status } = evidence;
+  let outcome;
+  if (errors.length > 0) {
+    outcome = `Outcome: ${status}; encountered ${errors.length} error(s).`;
+  } else if (filePaths.length > 0) {
+    outcome = `Outcome: ${status}; changed ${filePaths.length} file(s).`;
+  } else if (commands.length > 0) {
+    outcome = `Outcome: ${status}; ran ${commands.length} command(s).`;
+  } else {
+    outcome = `Outcome: ${status}.`;
+  }
+  if (agentMessage) {
+    const snippet = agentMessage.replace(/\s+/g, " ").trim().slice(0, 120);
+    outcome += ` Agent: ${snippet}.`;
+  }
+
+  const evidenceParts = [];
+  if (commands[0]) evidenceParts.push(`command=${commands[0]}`);
+  if (filePaths[0]) evidenceParts.push(`file=${filePaths[0]}`);
+  if (errors[0]) evidenceParts.push(`error=${errors[0]}`);
+  const evidenceStr = evidenceParts.length > 0
+    ? `Evidence: ${evidenceParts.join(", ")}.`
+    : "Evidence: none.";
+
+  const lineageParts = [];
+  if (evidence.parentTurnId) lineageParts.push(`parent=${evidence.parentTurnId}`);
+  const lineage = lineageParts.length > 0
+    ? `Lineage: ${lineageParts.join(", ")}.`
+    : "Lineage: root or standalone turn.";
+
+  return `${outcome} ${evidenceStr} ${lineage}`.slice(0, MAX_SYNTHETIC_SUMMARY_CHARS);
+}
+
+function buildEvidenceBasedSummaryNode(threadId, turnId, evidence) {
+  const signal = computeSignal(evidence);
+  const compactSummary = buildCompactSummary(turnId, evidence);
+  const agentSnippet = evidence.agentMessage
+    ? evidence.agentMessage.replace(/\s+/g, " ").trim().slice(0, 120)
+    : null;
+
+  return {
+    node_id: `turn:${turnId}`,
+    parent_id: evidence.parentTurnId ? `turn:${evidence.parentTurnId}` : null,
+    node_type: "turn",
+    title: `Turn ${turnId}`,
+    summary: compactSummary,
+    status: evidence.status,
+    brief: {
+      signal,
+      agent_message: agentSnippet,
+      primary_command: evidence.commands[0] ?? null,
+      primary_file_path: evidence.filePaths[0] ?? null,
+      primary_error: evidence.errors[0] ?? null,
+    },
+    lineage: {
+      parent_turn_id: evidence.parentTurnId ?? null,
+      forked_from_thread_id: null,
+      started_after_rollback: false,
+    },
+    counts: {
+      commands_total: evidence.commands.length,
+      commands_indexed: Math.min(evidence.commands.length, 5),
+      commands_omitted: Math.max(0, evidence.commands.length - 5),
+      file_paths_total: evidence.filePaths.length,
+      file_paths_indexed: Math.min(evidence.filePaths.length, 5),
+      file_paths_omitted: Math.max(0, evidence.filePaths.length - 5),
+      errors_total: evidence.errors.length,
+      errors_indexed: Math.min(evidence.errors.length, 5),
+      errors_omitted: Math.max(0, evidence.errors.length - 5),
+    },
+    digest: {
+      command_examples: evidence.commands.slice(0, 5),
+      file_path_examples: evidence.filePaths.slice(0, 5),
+      error_examples: evidence.errors.slice(0, 5),
+    },
+    evidence: {
+      file_paths: evidence.filePaths.slice(0, 10),
+      commands: evidence.commands.slice(0, 10).map((cmd) => ({
+        command: cmd,
+        exit_code: evidence.errors.some((e) => e.startsWith(cmd)) ? 1 : 0,
+      })),
+      errors: evidence.errors.slice(0, 10),
+    },
+  };
+}
+
+/**
+ * Call OpenAI to generate LLM-enhanced summaries for turns missing persisted ones.
+ * Falls back gracefully if OPENAI_API_KEY is not set.
+ */
+async function generateLLMSummaries(turnEvidence) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.log("[summary] No OPENAI_API_KEY set — using mechanical summaries only");
+    return new Map();
+  }
+
+  const inputs = [];
+  for (const [turnId, ev] of turnEvidence) {
+    inputs.push({
+      turn_id: turnId,
+      status: ev.status,
+      parent_turn_id: ev.parentTurnId,
+      signal: computeSignal(ev),
+      last_agent_message: ev.agentMessage?.slice(0, 200) ?? null,
+      primary_command: ev.commands[0] ?? null,
+      primary_file_path: ev.filePaths[0] ?? null,
+      primary_error: ev.errors[0] ?? null,
+      total_commands: ev.commands.length,
+      total_file_paths: ev.filePaths.length,
+      total_errors: ev.errors.length,
+      command_examples: ev.commands.slice(0, 3),
+      file_path_examples: ev.filePaths.slice(0, 3),
+      error_examples: ev.errors.slice(0, 3),
+    });
+  }
+
+  if (inputs.length === 0) return new Map();
+
+  console.log(`[summary] Calling ${SUMMARY_LLM_MODEL} for ${inputs.length} turn(s)…`);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SUMMARY_LLM_TIMEOUT_MS);
+
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: SUMMARY_LLM_MODEL,
+        max_completion_tokens: SUMMARY_LLM_MAX_TOKENS,
+        temperature: 0.3,
+        messages: [
+          { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+          { role: "user", content: JSON.stringify(inputs, null, 2) },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(`[summary] OpenAI API error ${res.status}: ${text.slice(0, 200)}`);
+      return new Map();
+    }
+
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content ?? "[]";
+    // Parse response — handle markdown fences
+    let items;
+    try {
+      items = JSON.parse(raw);
+    } catch {
+      const start = raw.indexOf("[");
+      const end = raw.lastIndexOf("]");
+      if (start >= 0 && end > start) {
+        items = JSON.parse(raw.slice(start, end + 1));
+      } else {
+        throw new Error("no JSON array found");
+      }
+    }
+
+    const result = new Map();
+    for (const item of items) {
+      if (item.turn_id && item.summary) {
+        result.set(item.turn_id, item.summary);
+      }
+    }
+    console.log(`[summary] Got LLM summaries for ${result.size} turn(s)`);
+    return result;
+  } catch (err) {
+    console.error(`[summary] LLM call failed: ${err.message}`);
+    return new Map();
+  }
+}
+
+function isStructuredSummary(text) {
+  const lower = text.toLowerCase();
+  return lower.includes("outcome:") && lower.includes("evidence:") && lower.includes("lineage:");
+}
+
 function buildReplayMessages(rolloutLines) {
   const messages = [];
   let threadId = null;
@@ -293,6 +552,7 @@ function buildReplayMessages(rolloutLines) {
   const summaryFallbackByTurn = new Map();
   const turnParentMap = new Map();
   const turnCompletionCache = new Map();
+  const evidenceCollector = new TurnEvidenceCollector();
 
   function ensureTurnOpen(ts) {
     if (!currentTurnId) {
@@ -358,7 +618,10 @@ function buildReplayMessages(rolloutLines) {
       const sub = p.type;
 
       if (sub === "task_started") {
-        if (currentTurnId) turnParentMap.set(p.turn_id, currentTurnId);
+        if (currentTurnId) {
+          turnParentMap.set(p.turn_id, currentTurnId);
+          evidenceCollector.setParentTurnId(p.turn_id, currentTurnId);
+        }
         currentTurnId = p.turn_id;
         messages.push({
           ts,
@@ -397,14 +660,18 @@ function buildReplayMessages(rolloutLines) {
         const completedTurnId = p.turn_id || currentTurnId || "";
         const summaryText = p.last_agent_message ?? "";
         const parentTurnId = turnParentMap.get(completedTurnId) ?? null;
-        const summaryNode = resolveSummaryNode(
-          threadId,
-          completedTurnId,
-          "completed",
-          parentTurnId,
-          summaryText,
-          summaryFallbackByTurn,
-        );
+        // Record agent message and status in evidence
+        if (completedTurnId) {
+          evidenceCollector.setStatus(completedTurnId, "completed");
+          if (summaryText) evidenceCollector.setAgentMessage(completedTurnId, summaryText);
+          if (parentTurnId) evidenceCollector.setParentTurnId(completedTurnId, parentTurnId);
+        }
+        // Try persisted summary first, then build from evidence
+        const persistedNode = readTurnSummaryNode(threadId, completedTurnId);
+        const summaryNode = persistedNode
+          ?? (completedTurnId && evidenceCollector.byTurn.has(completedTurnId)
+            ? buildEvidenceBasedSummaryNode(threadId ?? "", completedTurnId, evidenceCollector.byTurn.get(completedTurnId))
+            : resolveSummaryNode(threadId, completedTurnId, "completed", parentTurnId, summaryText, summaryFallbackByTurn));
         summaryFallbackByTurn.set(completedTurnId, summaryNode);
         if (summaryNode) {
           messages.push({
@@ -443,14 +710,16 @@ function buildReplayMessages(rolloutLines) {
         const completedTurnId = p.turn_id || currentTurnId || "";
         const summaryText = p.last_agent_message ?? "";
         const parentTurnId = turnParentMap.get(completedTurnId) ?? null;
-        const summaryNode = resolveSummaryNode(
-          threadId,
-          completedTurnId,
-          "interrupted",
-          parentTurnId,
-          summaryText,
-          summaryFallbackByTurn,
-        );
+        if (completedTurnId) {
+          evidenceCollector.setStatus(completedTurnId, "interrupted");
+          if (summaryText) evidenceCollector.setAgentMessage(completedTurnId, summaryText);
+          if (parentTurnId) evidenceCollector.setParentTurnId(completedTurnId, parentTurnId);
+        }
+        const persistedNode = readTurnSummaryNode(threadId, completedTurnId);
+        const summaryNode = persistedNode
+          ?? (completedTurnId && evidenceCollector.byTurn.has(completedTurnId)
+            ? buildEvidenceBasedSummaryNode(threadId ?? "", completedTurnId, evidenceCollector.byTurn.get(completedTurnId))
+            : resolveSummaryNode(threadId, completedTurnId, "interrupted", parentTurnId, summaryText, summaryFallbackByTurn));
         summaryFallbackByTurn.set(completedTurnId, summaryNode);
         if (summaryNode) {
           messages.push({
@@ -546,6 +815,7 @@ function buildReplayMessages(rolloutLines) {
 
         if (name === "shell_command" || name === "exec_command" || name === "shell" || name === "write_stdin") {
           const { command, cwd } = extractCommand(name, call.arguments);
+          if (currentTurnId) evidenceCollector.addCommand(currentTurnId, command, exitCode);
           messages.push({
             ts,
             msg: {
@@ -573,6 +843,9 @@ function buildReplayMessages(rolloutLines) {
 
         if (name === "apply_patch") {
           const filePaths = extractFilePaths(call.arguments);
+          if (currentTurnId) {
+            for (const fp of filePaths) evidenceCollector.addFilePath(currentTurnId, fp);
+          }
           messages.push({
             ts,
             msg: {
@@ -639,6 +912,9 @@ function buildReplayMessages(rolloutLines) {
 
         if (name === "apply_patch") {
           const filePaths = extractFilePaths(call.input);
+          if (currentTurnId) {
+            for (const fp of filePaths) evidenceCollector.addFilePath(currentTurnId, fp);
+          }
           messages.push({
             ts,
             msg: {
@@ -734,7 +1010,7 @@ function buildReplayMessages(rolloutLines) {
     });
   }
 
-  return messages;
+  return { messages, evidenceCollector, threadId };
 }
 
 function loadAndBuild(filePath) {
@@ -743,11 +1019,58 @@ function loadAndBuild(filePath) {
   return buildReplayMessages(rolloutLines);
 }
 
+/**
+ * Enhance summary nodes in messages with LLM-generated summaries.
+ * Only enhances turns that don't already have a persisted summary.
+ */
+async function enhanceWithLLM(result) {
+  const { messages, evidenceCollector, threadId } = result;
+  // Identify turns that need LLM enhancement (no persisted summary)
+  const turnsNeedingLLM = new Map();
+  for (const [turnId, ev] of evidenceCollector.byTurn) {
+    const persisted = readTurnSummaryNode(threadId, turnId);
+    if (!persisted) {
+      turnsNeedingLLM.set(turnId, ev);
+    }
+  }
+
+  if (turnsNeedingLLM.size === 0) {
+    console.log("[summary] All turns have persisted summaries");
+    return messages;
+  }
+
+  const llmSummaries = await generateLLMSummaries(turnsNeedingLLM);
+
+  // Replace summary nodes in messages with LLM-enhanced versions
+  if (llmSummaries.size > 0) {
+    for (const msg of messages) {
+      const m = msg.msg;
+      if (m.method !== "agentcanvas/summaryNode") continue;
+      const turnId = m.params?.turnId;
+      const llmText = llmSummaries.get(turnId);
+      if (!llmText || !isStructuredSummary(llmText)) continue;
+
+      // Replace the summary text in the node
+      const node = m.params.node;
+      if (node) {
+        node.summary = llmText;
+      }
+    }
+  }
+
+  return messages;
+}
+
 // Pre-load default if specified
+let defaultResult = null;
 let defaultMessages = null;
 if (defaultRolloutPath) {
-  defaultMessages = loadAndBuild(defaultRolloutPath);
-  console.log(`Pre-loaded ${defaultMessages.length} messages from default rollout`);
+  defaultResult = loadAndBuild(defaultRolloutPath);
+  // Enhance with LLM asynchronously
+  enhanceWithLLM(defaultResult).then((msgs) => {
+    defaultMessages = msgs;
+    console.log(`Pre-loaded ${defaultMessages.length} messages from default rollout`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +1111,8 @@ wss.on("connection", async (ws, req) => {
     if (fileParam) {
       const filePath = resolve(fileParam);
       console.log(`\n[ws] Client requested session: ${filePath}`);
-      replayMessages = loadAndBuild(filePath);
+      const result = loadAndBuild(filePath);
+      replayMessages = await enhanceWithLLM(result);
     }
   } catch (e) {
     console.error("[ws] Error parsing connection URL:", e.message);
