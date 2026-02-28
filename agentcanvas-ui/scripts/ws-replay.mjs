@@ -16,6 +16,23 @@ import { URL } from "node:url";
 import { WebSocketServer } from "ws";
 
 const WATCH_POLL_INTERVAL_MS = 1000;
+const MAX_SUMMARY_BODY_BYTES = 128 * 1024;
+const SUMMARY_OPENAI_SYSTEM_PROMPT = `
+You summarize one engineering turn into structured UI output.
+Return strict JSON with this shape:
+{
+  "summaryText": "string",
+  "signal": "error|agent_message|command_activity|file_change|status_only",
+  "primaryCommand": "string|null",
+  "primaryFilePath": "string|null",
+  "primaryError": "string|null"
+}
+Rules:
+- Keep summaryText concise (max 180 chars).
+- Be factual; do not invent details.
+- If there is an error, signal must be "error".
+- If no useful details exist, set signal to "status_only".
+`.trim();
 
 const args = process.argv.slice(2);
 
@@ -32,6 +49,14 @@ const PORT = Number.isFinite(rawPort) && rawPort > 0 ? Math.floor(rawPort) : 808
 const SPEED = Number.isFinite(rawSpeed) && rawSpeed > 0 ? rawSpeed : 10;
 const WATCH_MODE = hasFlag("--watch");
 const USE_LATEST = hasFlag("--latest");
+const SUMMARY_MODE = (process.env.AGENTCANVAS_SUMMARY_MODE || "local").toLowerCase();
+const OPENAI_API_KEY = process.env.AGENTCANVAS_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "";
+const OPENAI_BASE_URL = (
+  process.env.AGENTCANVAS_OPENAI_BASE_URL
+  || process.env.OPENAI_BASE_URL
+  || "https://api.openai.com/v1"
+).replace(/\/$/, "");
+const OPENAI_SUMMARY_MODEL = process.env.AGENTCANVAS_SUMMARY_MODEL || "gpt-4o-mini";
 
 let fileArg;
 for (let i = 0; i < args.length; i += 1) {
@@ -784,6 +809,295 @@ function fileSize(filePath) {
   }
 }
 
+function toTrimmedString(value, maxLen = 4000) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return trimmed.slice(0, maxLen);
+}
+
+function toNullableString(value, maxLen = 4000) {
+  const text = toTrimmedString(value, maxLen);
+  return text || null;
+}
+
+function toStringList(value, maxItems = 64, maxLen = 400) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const entry of value) {
+    const text = toTrimmedString(entry, maxLen);
+    if (!text) continue;
+    if (!out.includes(text)) out.push(text);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function toCommands(value, maxItems = 64) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const command = toTrimmedString(entry.command, 1000);
+    if (!command) continue;
+    const rawExitCode = entry.exitCode;
+    const exitCode = rawExitCode === null || rawExitCode === undefined
+      ? null
+      : Number.isFinite(Number(rawExitCode))
+        ? Number(rawExitCode)
+        : null;
+    out.push({ command, exitCode });
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function normalizeSummaryStatus(rawStatus) {
+  if (rawStatus === "success" || rawStatus === "completed") return "completed";
+  if (rawStatus === "error" || rawStatus === "failed") return "failed";
+  if (rawStatus === "cancelled") return "cancelled";
+  return "in_progress";
+}
+
+function summarizeSignalFromInput(payload) {
+  const hasCommandFailure = payload.commands.some((command) => command.exitCode !== null && command.exitCode !== 0);
+  if (payload.status === "failed" || payload.errors.length > 0 || hasCommandFailure) return "error";
+  if (payload.assistantMessage) return "agent_message";
+  if (payload.commands.length > 0) return "command_activity";
+  if (payload.filePaths.length > 0) return "file_change";
+  return "status_only";
+}
+
+function summarizeTextFromInput(payload) {
+  if (payload.assistantMessage) return payload.assistantMessage;
+  const parts = [];
+  if (payload.commands.length > 0) {
+    parts.push(`${payload.commands.length} command${payload.commands.length === 1 ? "" : "s"}`);
+  }
+  if (payload.filePaths.length > 0) {
+    parts.push(`${payload.filePaths.length} file${payload.filePaths.length === 1 ? "" : "s"} changed`);
+  }
+  if (payload.errors.length > 0) {
+    parts.push(`${payload.errors.length} error${payload.errors.length === 1 ? "" : "s"}`);
+  }
+  return parts.join(" | ");
+}
+
+function parseSummaryRequest(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const turnId = toTrimmedString(payload.turnId, 256);
+  if (!turnId) return null;
+
+  return {
+    turnId,
+    sessionId: toNullableString(payload.sessionId, 256),
+    status: normalizeSummaryStatus(toTrimmedString(payload.status, 64)),
+    parentTurnId: toNullableString(payload.parentTurnId, 256),
+    childTurnIds: toStringList(payload.childTurnIds, 64, 256),
+    assistantMessage: toNullableString(payload.assistantMessage, 2000),
+    commands: toCommands(payload.commands, 64),
+    filePaths: toStringList(payload.filePaths, 128, 512),
+    errors: toStringList(payload.errors, 64, 1000),
+  };
+}
+
+function buildSummaryNodePayload(payload, modelSummary) {
+  const summaryText = toTrimmedString(modelSummary?.summaryText, 180) || summarizeTextFromInput(payload);
+  const fallbackSignal = summarizeSignalFromInput(payload);
+  const signal = toTrimmedString(modelSummary?.signal, 40) || fallbackSignal;
+  const primaryCommand = toNullableString(modelSummary?.primaryCommand, 1000)
+    ?? payload.commands[payload.commands.length - 1]?.command
+    ?? null;
+  const primaryFilePath = toNullableString(modelSummary?.primaryFilePath, 512)
+    ?? payload.filePaths[payload.filePaths.length - 1]
+    ?? null;
+  const primaryError = toNullableString(modelSummary?.primaryError, 1000)
+    ?? payload.errors[payload.errors.length - 1]
+    ?? null;
+  const commandsIndexed = Math.min(payload.commands.length, 50);
+  const filePathsIndexed = Math.min(payload.filePaths.length, 50);
+  const errorsIndexed = Math.min(payload.errors.length, 50);
+
+  return {
+    nodeType: "turn",
+    status: payload.status,
+    summaryText,
+    brief: {
+      signal,
+      agentMessage: payload.assistantMessage,
+      primaryCommand,
+      primaryFilePath,
+      primaryError,
+    },
+    counts: {
+      commandsTotal: payload.commands.length,
+      commandsIndexed,
+      commandsOmitted: payload.commands.length - commandsIndexed,
+      filePathsTotal: payload.filePaths.length,
+      filePathsIndexed,
+      filePathsOmitted: payload.filePaths.length - filePathsIndexed,
+      errorsTotal: payload.errors.length,
+      errorsIndexed,
+      errorsOmitted: payload.errors.length - errorsIndexed,
+    },
+    digest: {
+      commandExamples: payload.commands.map((command) => command.command).slice(0, 3),
+      filePathExamples: payload.filePaths.slice(0, 5),
+      errorExamples: payload.errors.slice(0, 5),
+    },
+    lineage: {
+      parentTurnId: payload.parentTurnId,
+      childTurnId: payload.childTurnIds[payload.childTurnIds.length - 1] ?? null,
+      childTurnIds: payload.childTurnIds,
+      forkedFromThreadId: null,
+      startedAfterRollback: false,
+      wasRolledBack: payload.status === "cancelled",
+    },
+    evidence: {
+      childTurnIds: payload.childTurnIds,
+      filePaths: payload.filePaths,
+      commands: payload.commands,
+      errors: payload.errors,
+    },
+  };
+}
+
+function parseJsonSafe(input) {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    req.on("data", (chunk) => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_SUMMARY_BODY_BYTES) {
+        reject(new Error("payload_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf-8");
+      const parsed = parseJsonSafe(text);
+      if (!parsed || typeof parsed !== "object") {
+        reject(new Error("invalid_json"));
+        return;
+      }
+      resolve(parsed);
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(payload));
+}
+
+async function summarizeWithOpenAi(payload) {
+  const promptInput = {
+    turnId: payload.turnId,
+    sessionId: payload.sessionId,
+    status: payload.status,
+    parentTurnId: payload.parentTurnId,
+    childTurnIds: payload.childTurnIds.slice(0, 12),
+    assistantMessage: payload.assistantMessage,
+    commands: payload.commands.slice(-12),
+    filePaths: payload.filePaths.slice(0, 20),
+    errors: payload.errors.slice(0, 12),
+  };
+
+  const response = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_SUMMARY_MODEL,
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SUMMARY_OPENAI_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: JSON.stringify(promptInput),
+        },
+      ],
+    }),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    const preview = responseText.slice(0, 500);
+    throw new Error(`openai_error_${response.status}:${preview}`);
+  }
+
+  const parsed = parseJsonSafe(responseText);
+  const modelContent = parsed?.choices?.[0]?.message?.content;
+  if (typeof modelContent !== "string") {
+    return null;
+  }
+  const summaryObject = parseJsonSafe(modelContent);
+  if (!summaryObject || typeof summaryObject !== "object") {
+    return null;
+  }
+  return summaryObject;
+}
+
+async function handleSummarizeRequest(req, res) {
+  if (SUMMARY_MODE !== "openai") {
+    sendJson(res, 409, { error: "summary_mode_not_openai" });
+    return;
+  }
+  if (!OPENAI_API_KEY) {
+    sendJson(res, 503, { error: "missing_openai_api_key" });
+    return;
+  }
+
+  let requestBody;
+  try {
+    requestBody = await readJsonBody(req);
+  } catch (err) {
+    if (err instanceof Error && err.message === "payload_too_large") {
+      sendJson(res, 413, { error: "payload_too_large" });
+      return;
+    }
+    sendJson(res, 400, { error: "invalid_request_json" });
+    return;
+  }
+
+  const parsed = parseSummaryRequest(requestBody);
+  if (!parsed) {
+    sendJson(res, 400, { error: "invalid_summary_payload" });
+    return;
+  }
+
+  let openAiSummary = null;
+  try {
+    openAiSummary = await summarizeWithOpenAi(parsed);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "summary_call_failed";
+    sendJson(res, 502, { error: "openai_summary_failed", detail: message });
+    return;
+  }
+
+  const node = buildSummaryNodePayload(parsed, openAiSummary);
+  sendJson(res, 200, {
+    turnId: parsed.turnId,
+    node,
+    provider: "openai",
+    model: OPENAI_SUMMARY_MODEL,
+  });
+}
+
 let defaultRolloutPath = INITIAL_FILE;
 if (USE_LATEST && !defaultRolloutPath) {
   defaultRolloutPath = getLatestSessionFile();
@@ -794,7 +1108,7 @@ if (USE_LATEST && !defaultRolloutPath) {
 
 const server = createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
@@ -803,10 +1117,16 @@ const server = createServer((req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/api/sessions") {
+  const requestUrl = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/sessions") {
     const sessions = getSessionList();
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(sessions));
+    sendJson(res, 200, sessions);
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/summarize") {
+    void handleSummarizeRequest(req, res);
     return;
   }
 
@@ -904,7 +1224,9 @@ wss.on("connection", async (ws, req) => {
 
 server.listen(PORT, () => {
   console.log(`Replay server running on http://localhost:${PORT}`);
+  console.log(`  Sessions dir: ${SESSIONS_DIR}`);
   console.log("  GET /api/sessions — list available sessions");
+  console.log(`  POST /api/summarize — OpenAI summary mode: ${SUMMARY_MODE}`);
   console.log(`  WS  ws://localhost:${PORT}[?watch=1|?file=<path>]`);
   console.log(`  Speed: ${watchModeLabel()}`);
 });

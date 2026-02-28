@@ -3,7 +3,7 @@
 /**
  * list-sessions.mjs — List available Codex rollout sessions.
  *
- * Scans ~/.codex/sessions/ for rollout JSONL files and displays a summary
+ * Scans the rollout sessions directory (~/.codex/sessions) and displays a summary
  * of each session: date, turn count, source, working directory, and file path.
  *
  * Usage: node scripts/list-sessions.mjs [--limit 20]
@@ -14,9 +14,13 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const args = process.argv.slice(2);
-const limitIdx = args.indexOf("--limit");
-const LIMIT = limitIdx !== -1 ? Number(args[limitIdx + 1]) : 20;
+const argValue = (name) => {
+  const idx = args.indexOf(name);
+  return idx === -1 ? undefined : args[idx + 1];
+};
 
+const limitRaw = argValue("--limit");
+const LIMIT = Number.isFinite(Number(limitRaw)) ? Number(limitRaw) : 20;
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 
 function findAllRollouts(dir) {

@@ -53,6 +53,27 @@ const kindConfig: Record<NodeKind, KindConfig> = {
     border: 'border-red-700/50',
     iconBg: 'bg-red-900/50 text-red-300',
   },
+  summary: {
+    icon: 'S',
+    badge: 'bg-fuchsia-900/60 text-fuchsia-300 border border-fuchsia-700/40',
+    badgeText: 'SUMMARY',
+    border: 'border-fuchsia-700/40',
+    iconBg: 'bg-fuchsia-900/50 text-fuchsia-300',
+  },
+  phase: {
+    icon: 'Φ',
+    badge: 'bg-violet-900/60 text-violet-300 border border-violet-700/40',
+    badgeText: 'PHASE',
+    border: 'border-violet-700/40',
+    iconBg: 'bg-violet-900/50 text-violet-300',
+  },
+  session: {
+    icon: '◉',
+    badge: 'bg-indigo-900/60 text-indigo-300 border border-indigo-700/40',
+    badgeText: 'SESSION',
+    border: 'border-indigo-700/30',
+    iconBg: 'bg-indigo-900/50 text-indigo-300',
+  },
   turn: {
     icon: '◆',
     badge: 'bg-indigo-900/60 text-indigo-300 border border-indigo-700/40',

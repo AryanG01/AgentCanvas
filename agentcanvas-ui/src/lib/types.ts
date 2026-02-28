@@ -73,6 +73,53 @@ export interface PlanUpdateEvent {
   ts: number
 }
 
+export interface SummaryNodeEvent {
+  type: 'SummaryNode'
+  id: string
+  turnId: string
+  nodeType: 'turn' | 'phase'
+  status: string
+  summaryText: string
+  brief: {
+    signal: string
+    agentMessage: string | null
+    primaryCommand: string | null
+    primaryFilePath: string | null
+    primaryError: string | null
+  }
+  counts: {
+    commandsTotal: number
+    commandsIndexed: number
+    commandsOmitted: number
+    filePathsTotal: number
+    filePathsIndexed: number
+    filePathsOmitted: number
+    errorsTotal: number
+    errorsIndexed: number
+    errorsOmitted: number
+  }
+  digest: {
+    commandExamples: string[]
+    filePathExamples: string[]
+    errorExamples: string[]
+  }
+  lineage: {
+    parentTurnId: string | null
+    childTurnId: string | null
+    childTurnIds: string[]
+    forkedFromThreadId: string | null
+    startedAfterRollback: boolean
+    wasRolledBack: boolean
+  }
+  evidence: {
+    childTurnIds: string[]
+    filePaths: string[]
+    commands: Array<{ command: string; exitCode: number | null }>
+    errors: string[]
+  }
+  ts: number
+}
+
 export interface AssistantMessageEvent {
   type: 'AssistantMessage'
   id: string
@@ -97,6 +144,7 @@ export type AppEvent =
   | McpToolCallEvent
   | PatchApplyEvent
   | PlanUpdateEvent
+  | SummaryNodeEvent
   | AssistantMessageEvent
   | UserPromptPatchEvent
 
@@ -104,7 +152,7 @@ export type AppEvent =
 // Graph node types
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'output' | 'error'
+export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'output' | 'error' | 'summary' | 'phase'
 
 export interface GraphNodeData {
   kind: NodeKind

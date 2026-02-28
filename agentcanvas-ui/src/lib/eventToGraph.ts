@@ -106,6 +106,101 @@ export function buildGraph(events: AppEvent[]): GraphResult {
     } else if (event.type === 'TurnComplete') {
       const node = nodes.find(n => n.id === `turn-${event.turnId}`)
       if (node) node.data = { ...node.data, status: event.status }
+    } else if (event.type === 'SummaryNode') {
+      const summaryStatus =
+        event.status === 'rolled_back'
+          ? 'cancelled'
+          : event.status === 'in_progress'
+            ? 'running'
+            : event.status === 'failed' || event.brief.signal === 'error' || event.status === 'error'
+              ? 'error'
+              : 'success'
+
+      if (event.nodeType === 'phase') {
+        const phaseNodeId = `phase-${event.id}`
+        const phaseLabel = event.summaryText.trim() ||
+          `Phase (${event.lineage.childTurnIds.length} turn${event.lineage.childTurnIds.length === 1 ? '' : 's'})`
+        const existingPhaseNode = nodes.find(n => n.id === phaseNodeId)
+        if (existingPhaseNode) {
+          existingPhaseNode.data = {
+            ...existingPhaseNode.data,
+            label: phaseLabel,
+            status: summaryStatus,
+            rawEvent: event,
+          }
+        } else {
+          nodes.push({
+            id: phaseNodeId,
+            type: 'eventNode',
+            position: { x: 0, y: 0 },
+            data: {
+              kind: 'phase',
+              label: phaseLabel,
+              status: summaryStatus,
+              turnId: event.turnId,
+              rawEvent: event,
+            },
+          })
+        }
+
+        const phaseEdgeSources = event.lineage.childTurnIds.length > 0
+          ? event.lineage.childTurnIds
+          : [event.turnId]
+        for (const phaseTurnId of phaseEdgeSources) {
+          const edgeId = `detail-${phaseNodeId}-${phaseTurnId}`
+          if (!edges.find(e => e.id === edgeId)) {
+            edges.push({
+              id: edgeId,
+              source: `turn-${phaseTurnId}`,
+              target: phaseNodeId,
+              data: { kind: 'detail' },
+            })
+          }
+        }
+      } else {
+        const turnNode = nodes.find(n => n.id === `turn-${event.turnId}`)
+        if (turnNode) {
+          if (turnNode.data.label === '(typing…)' && event.summaryText.trim()) {
+            turnNode.data = { ...turnNode.data, label: event.summaryText }
+          }
+          if (event.status === 'rolled_back') {
+            turnNode.data = { ...turnNode.data, status: 'cancelled' }
+          }
+        }
+
+        const summaryNodeId = `summary-${event.turnId}`
+        const summaryLabel = event.summaryText.trim()
+          || event.brief.agentMessage?.trim()
+          || `${event.brief.signal} summary`
+        const existingSummaryNode = nodes.find(n => n.id === summaryNodeId)
+        if (existingSummaryNode) {
+          existingSummaryNode.data = {
+            ...existingSummaryNode.data,
+            label: summaryLabel,
+            status: summaryStatus,
+            rawEvent: event,
+          }
+        } else {
+          nodes.push({
+            id: summaryNodeId,
+            type: 'eventNode',
+            position: { x: 0, y: 0 },
+            data: {
+              kind: 'summary',
+              label: summaryLabel,
+              status: summaryStatus,
+              turnId: event.turnId,
+              rawEvent: event,
+            },
+          })
+          edges.push({
+            id: `detail-${summaryNodeId}`,
+            source: `turn-${event.turnId}`,
+            target: summaryNodeId,
+            data: { kind: 'detail' },
+          })
+        }
+      }
     } else if (event.type === 'CommandExecution') {
       // Failed commands → individual error nodes
       if (failedCmds.has(event.id)) {

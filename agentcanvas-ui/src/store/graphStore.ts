@@ -79,7 +79,7 @@ function recompute(
   // Filter: only show event nodes for expanded turns
   const nodes = allNodes.filter(n => {
     const kind = n.data.kind
-    if (kind === 'session' || kind === 'turn') return true
+    if (kind === 'session' || kind === 'turn' || kind === 'output') return true
     // Event nodes: only show if their parent turn is expanded
     return expandedTurns.has(n.data.turnId)
   })
@@ -104,7 +104,19 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   addEvent: (event) => {
     const state = get()
-    const events = [...state.events, event]
+    const events = event.type === 'SummaryNode'
+      ? [
+          ...state.events.filter(
+            existing =>
+              existing.type !== 'SummaryNode'
+              || !(
+                existing.id === event.id
+                || (existing.turnId === event.turnId && existing.nodeType === event.nodeType)
+              ),
+          ),
+          event,
+        ]
+      : [...state.events, event]
     const turnToSession = new Map(state.turnToSession)
     if (event.type === 'TurnStarted') turnToSession.set(event.turnId, event.sessionId)
 

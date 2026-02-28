@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "agentcanvas",
+    "agentcanvas-memory-backend",
     "backend-client",
     "ansi-escape",
     "async-utils",
