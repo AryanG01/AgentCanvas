@@ -7,13 +7,17 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "replay": "node scripts/ws-replay.mjs --latest --speed 10",
+    "replay:list": "node scripts/list-sessions.mjs",
+    "replay:slow": "node scripts/ws-replay.mjs --latest --speed 1"
   },
   "dependencies": {
     "@xyflow/react": "^12.10.1",
     "dagre": "^0.8.5",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
+    "ws": "^8.18.0",
     "zustand": "^5.0.11"
   },
   "devDependencies": {

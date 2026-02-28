@@ -1,8 +1,10 @@
 //! Session summary schema and deterministic summary builder.
 
+pub(crate) mod llm_summarizer;
 mod schema;
 mod summarizer;
 
+pub use llm_summarizer::LlmSummaryConfig;
 pub use schema::CommandEvidence;
 pub use schema::EventReference;
 pub use schema::SESSION_SUMMARY_SCHEMA_VERSION;

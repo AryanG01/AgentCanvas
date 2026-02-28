@@ -76,6 +76,7 @@ export function useAppServerWS(overrideUrl?: string) {
 
   useEffect(() => {
     if (USE_MOCK) return  // skip WS entirely in mock mode
+    if (!url) return       // no URL yet — wait for session selection
 
     unmountedRef.current = false
 
@@ -88,13 +89,16 @@ export function useAppServerWS(overrideUrl?: string) {
       ws.onopen = () => {
         backoffRef.current = 1000
         setWsStatus('connected')
-        // Initialize handshake
-        ws.send(JSON.stringify({
-          method: 'initialize',
-          id: 0,
-          params: { clientInfo: { name: 'agentcanvas_ui', version: '0.1.0' } },
-        }))
-        ws.send(JSON.stringify({ method: 'initialized', params: {} }))
+        // Skip handshake for replay connections (they start streaming immediately)
+        const isReplay = url.includes('?file=')
+        if (!isReplay) {
+          ws.send(JSON.stringify({
+            method: 'initialize',
+            id: 0,
+            params: { clientInfo: { name: 'agentcanvas_ui', version: '0.1.0' } },
+          }))
+          ws.send(JSON.stringify({ method: 'initialized', params: {} }))
+        }
       }
 
       ws.onmessage = (ev) => {
@@ -151,9 +155,13 @@ export function useAppServerWS(overrideUrl?: string) {
       ws.onclose = () => {
         if (unmountedRef.current) return
         setWsStatus('disconnected')
-        const delay = backoffRef.current
-        backoffRef.current = Math.min(delay * 2, MAX_BACKOFF)
-        setTimeout(connect, delay)
+        // Don't auto-reconnect for replay sessions
+        const isReplay = url.includes('?file=')
+        if (!isReplay) {
+          const delay = backoffRef.current
+          backoffRef.current = Math.min(delay * 2, MAX_BACKOFF)
+          setTimeout(connect, delay)
+        }
       }
 
       ws.onerror = () => ws.close()

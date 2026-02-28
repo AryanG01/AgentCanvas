@@ -3,6 +3,7 @@ import { ReactFlowProvider } from '@xyflow/react'
 import { GraphCanvas } from './components/GraphCanvas'
 import { EvidencePanel } from './components/EvidencePanel'
 import { SearchBar } from './components/SearchBar'
+import { SessionPicker } from './components/SessionPicker'
 import { ConnectPanel } from './components/ConnectPanel'
 import { useAppServerWS } from './hooks/useAppServerWS'
 import { useGraphStore } from './store/graphStore'
@@ -27,6 +28,7 @@ function AppInner() {
 
   return (
     <div className="w-screen h-screen relative overflow-hidden bg-zinc-950">
+      <SessionPicker />
       <SearchBar />
       <GraphCanvas />
       <EvidencePanel />

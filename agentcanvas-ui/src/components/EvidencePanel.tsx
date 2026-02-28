@@ -1,6 +1,7 @@
 import { useGraphStore } from '../store/graphStore'
 import type {
   CommandExecutionEvent,
+  GraphNodeData,
   McpToolCallEvent,
   PatchApplyEvent,
   PlanUpdateEvent,
@@ -15,7 +16,7 @@ export function EvidencePanel() {
   const node = nodes.find(n => n.id === selectedId)
   if (!node) return null
 
-  const { rawEvent, kind, label } = node.data
+  const { rawEvent, kind, label, aggregatedCommands } = node.data as GraphNodeData
 
   const kindColors: Record<string, string> = {
     turn:    'text-indigo-400',
@@ -51,7 +52,9 @@ export function EvidencePanel() {
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto p-4 space-y-5">
-        {kind === 'command' || kind === 'error' ? (
+        {kind === 'command' && aggregatedCommands ? (
+          <CommandSummaryDetail commands={aggregatedCommands} />
+        ) : kind === 'command' || kind === 'error' ? (
           <CommandDetail event={rawEvent as CommandExecutionEvent} />
         ) : kind === 'tool' ? (
           <McpDetail event={rawEvent as McpToolCallEvent} />
@@ -95,6 +98,43 @@ function CommandDetail({ event }: { event: CommandExecutionEvent }) {
         </Section>
       )}
     </>
+  )
+}
+
+function CommandSummaryDetail({ commands }: { commands: CommandExecutionEvent[] }) {
+  return (
+    <Section title={`${commands.length} Command${commands.length !== 1 ? 's' : ''} Executed`}>
+      <div className="space-y-2">
+        {commands.map((cmd, i) => (
+          <div
+            key={cmd.id ?? i}
+            className="rounded-lg border border-zinc-800 bg-zinc-900 p-3"
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[10px] font-mono text-zinc-500">#{i + 1}</span>
+              <span className={`inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                cmd.exitCode === 0 || cmd.exitCode === null
+                  ? 'bg-green-900/50 text-green-300'
+                  : 'bg-red-900/50 text-red-300'
+              }`}>
+                <span className={`h-1.5 w-1.5 rounded-full ${
+                  cmd.exitCode === 0 || cmd.exitCode === null ? 'bg-green-400' : 'bg-red-400'
+                }`} />
+                {cmd.exitCode ?? 'ok'}
+              </span>
+            </div>
+            <pre className="text-xs text-yellow-300 whitespace-pre-wrap break-words leading-relaxed">
+              {cmd.cmd}
+            </pre>
+            {cmd.stdout && (
+              <pre className="text-[11px] text-zinc-500 whitespace-pre-wrap break-words mt-1.5 max-h-24 overflow-y-auto">
+                {cmd.stdout.slice(0, 500)}{cmd.stdout.length > 500 ? '…' : ''}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+    </Section>
   )
 }
 

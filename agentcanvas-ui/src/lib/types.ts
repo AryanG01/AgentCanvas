@@ -104,9 +104,24 @@ export interface GraphNodeData {
   turnId: string
   rawEvent: AppEvent
   collapsed?: boolean
+  itemCount?: number  // number of child items (for turn nodes)
+  aggregatedCommands?: CommandExecutionEvent[]  // for command summary nodes
 }
 
 // ---------------------------------------------------------------------------
 // Edge kinds — used to drive visual styling
 // ---------------------------------------------------------------------------
 export type EdgeKind = 'flow' | 'detail'
+
+// ---------------------------------------------------------------------------
+// Session info returned by the replay server's /api/sessions endpoint
+// ---------------------------------------------------------------------------
+export interface SessionInfo {
+  date: string
+  time: string
+  turns: number
+  source: string
+  cwd: string
+  file: string
+  id: string
+}

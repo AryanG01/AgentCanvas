@@ -23,8 +23,9 @@ pub use schema::{
 pub use bridge::{translate as translate_to_app_event, AppEvent};
 
 pub use summary::{
-    CommandEvidence, EventReference, SessionSummary, SessionSummaryMetadata, SessionSummarizer,
-    SummaryEvidence, SummaryNode, SummaryNodeType, TurnLineage, SESSION_SUMMARY_SCHEMA_VERSION,
+    CommandEvidence, EventReference, LlmSummaryConfig, SessionSummary, SessionSummaryMetadata,
+    SessionSummarizer, SummaryEvidence, SummaryNode, SummaryNodeType, TurnLineage,
+    SESSION_SUMMARY_SCHEMA_VERSION,
 };
 
 pub use utils::{generate_item_id, generate_turn_id};

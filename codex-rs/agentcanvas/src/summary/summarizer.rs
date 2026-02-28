@@ -361,6 +361,57 @@ impl SessionSummarizer {
         summarizer.build()
     }
 
+    /// Extract turn evidence from the current state (before `build()` consumes self).
+    pub fn extract_turn_evidence(&self) -> Vec<super::llm_summarizer::TurnEvidence> {
+        super::llm_summarizer::extract_turn_evidence(&self.turns)
+    }
+
+    /// Build the summary, then replace each Turn node's summary with an
+    /// LLM-generated natural-language description. Falls back to the
+    /// mechanical summary on any failure.
+    pub async fn build_with_llm(
+        self,
+        config: &super::llm_summarizer::LlmSummaryConfig,
+    ) -> Option<SessionSummary> {
+        let evidence = self.extract_turn_evidence();
+        let mut summary = self.build()?;
+
+        match super::llm_summarizer::generate_turn_summaries(config, &evidence).await {
+            Ok(llm_summaries) => {
+                for node in &mut summary.nodes {
+                    if node.node_type == SummaryNodeType::Turn {
+                        if let Some(turn_id) = &node.turn_id {
+                            if let Some(llm_summary) = llm_summaries.get(turn_id) {
+                                node.summary = Some(llm_summary.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("LLM summarization failed, using mechanical summaries: {err}");
+            }
+        }
+
+        Some(summary)
+    }
+
+    /// Convenience wrapper: ingest all events, then produce an LLM-enhanced
+    /// summary (falling back to mechanical summaries on failure).
+    pub async fn summarize_with_llm<'a, I>(
+        events: I,
+        config: &super::llm_summarizer::LlmSummaryConfig,
+    ) -> Option<SessionSummary>
+    where
+        I: IntoIterator<Item = &'a NormalizedEvent>,
+    {
+        let mut summarizer = SessionSummarizer::new();
+        for event in events {
+            summarizer.ingest(event);
+        }
+        summarizer.build_with_llm(config).await
+    }
+
     fn turn_mut(&mut self, turn_id: &str, timestamp: i64) -> &mut TurnAccumulator {
         if !self.turns.contains_key(turn_id) {
             self.turn_order.push(turn_id.to_string());
@@ -407,31 +458,31 @@ impl SourceTracker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CommandEvidenceKey {
-    command: String,
-    exit_code: Option<i32>,
+pub(crate) struct CommandEvidenceKey {
+    pub(crate) command: String,
+    pub(crate) exit_code: Option<i32>,
 }
 
 #[derive(Default)]
-struct TurnAccumulator {
-    started_at: Option<i64>,
-    status: Option<String>,
-    usage: Option<TokenUsage>,
-    last_agent_message: Option<String>,
-    plan_updates: Vec<String>,
-    commands: BTreeSet<CommandEvidenceKey>,
-    file_paths: BTreeSet<String>,
-    external_tools: BTreeSet<String>,
-    errors: BTreeSet<String>,
-    event_refs: Vec<EventReference>,
-    plan_event_refs: Vec<EventReference>,
-    execution_event_refs: Vec<EventReference>,
-    code_change_event_refs: Vec<EventReference>,
-    external_tool_event_refs: Vec<EventReference>,
-    error_event_refs: Vec<EventReference>,
-    has_failed_command: bool,
-    has_failed_patch: bool,
-    has_failed_external_tool: bool,
+pub(crate) struct TurnAccumulator {
+    pub(crate) started_at: Option<i64>,
+    pub(crate) status: Option<String>,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) last_agent_message: Option<String>,
+    pub(crate) plan_updates: Vec<String>,
+    pub(crate) commands: BTreeSet<CommandEvidenceKey>,
+    pub(crate) file_paths: BTreeSet<String>,
+    pub(crate) external_tools: BTreeSet<String>,
+    pub(crate) errors: BTreeSet<String>,
+    pub(crate) event_refs: Vec<EventReference>,
+    pub(crate) plan_event_refs: Vec<EventReference>,
+    pub(crate) execution_event_refs: Vec<EventReference>,
+    pub(crate) code_change_event_refs: Vec<EventReference>,
+    pub(crate) external_tool_event_refs: Vec<EventReference>,
+    pub(crate) error_event_refs: Vec<EventReference>,
+    pub(crate) has_failed_command: bool,
+    pub(crate) has_failed_patch: bool,
+    pub(crate) has_failed_external_tool: bool,
 }
 
 impl TurnAccumulator {

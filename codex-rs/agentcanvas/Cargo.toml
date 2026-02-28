@@ -30,6 +30,10 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 ts-rs = { workspace = true }
 
+# LLM summarization
+async-openai = { workspace = true }
+dotenvy = { workspace = true }
+
 # Utilities
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -51,6 +51,7 @@ export function GraphCanvas() {
   const rawEdges = useGraphStore(s => s.edges)
   const selectedId = useGraphStore(s => s.selectedNodeId)
   const selectNode = useGraphStore(s => s.selectNode)
+  const toggleTurn = useGraphStore(s => s.toggleTurn)
   const searchQuery = useGraphStore(s => s.searchQuery)
 
   const nodes = rawNodes.map(n => ({
@@ -76,8 +77,15 @@ export function GraphCanvas() {
   })
 
   const onNodeClick: NodeMouseHandler<Node<GraphNodeData>> = useCallback(
-    (_evt, node) => selectNode(node.id === selectedId ? null : node.id),
-    [selectedId, selectNode]
+    (_evt, node) => {
+      // Turn nodes: toggle expand/collapse
+      if (node.data.kind === 'turn') {
+        toggleTurn(node.data.turnId)
+        return
+      }
+      selectNode(node.id === selectedId ? null : node.id)
+    },
+    [selectedId, selectNode, toggleTurn]
   )
 
   return (

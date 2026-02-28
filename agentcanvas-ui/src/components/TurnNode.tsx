@@ -44,6 +44,17 @@ export const TurnNode = memo(({ data, selected }: NodeProps<GraphNodeData>) => {
         {data.label || <span className="text-zinc-500 italic">loading…</span>}
       </p>
 
+      {/* Item count / expand hint */}
+      {(data.itemCount ?? 0) > 0 && (
+        <div className="flex items-center gap-1 mt-2 pt-1.5 border-t border-zinc-700/50">
+          <span className="text-[10px] text-zinc-500">
+            {data.collapsed
+              ? `▸ ${data.itemCount} item${data.itemCount !== 1 ? 's' : ''} — click to expand`
+              : `▾ ${data.itemCount} item${data.itemCount !== 1 ? 's' : ''}`}
+          </span>
+        </div>
+      )}
+
       <Handle
         type="source"
         position={Position.Bottom}
