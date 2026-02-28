@@ -44,6 +44,7 @@ use super::list::parse_timestamp_uuid_from_filename;
 use super::metadata;
 use super::policy::EventPersistenceMode;
 use super::policy::is_persisted_response_item;
+use super::turn_summary_llm::LlmSummaryResult;
 use super::turn_summary_llm::TurnSummaryEvidence;
 use super::turn_summary_llm::TurnSummarySnapshot;
 use super::turn_summary_llm::generate_turn_summaries;
@@ -915,11 +916,11 @@ fn classify_turn_signal(
 
 fn build_compact_turn_summary(
     status: &str,
-    signal: &str,
-    parent_turn_id: Option<&str>,
-    child_turn_id: Option<&str>,
-    forked_from_thread_id: Option<&str>,
-    started_after_rollback: bool,
+    _signal: &str,
+    _parent_turn_id: Option<&str>,
+    _child_turn_id: Option<&str>,
+    _forked_from_thread_id: Option<&str>,
+    _started_after_rollback: bool,
     agent_message: Option<&str>,
     command_digest: &[String],
     file_path_digest: &[String],
@@ -928,67 +929,85 @@ fn build_compact_turn_summary(
     total_file_path_count: usize,
     total_error_count: usize,
 ) -> String {
-    let mut outcome = if total_error_count > 0 {
-        format!("Outcome: {status}; encountered {total_error_count} error(s).")
+    let mut parts = Vec::new();
+
+    // Lead with action verb + specifics
+    if total_error_count > 0 {
+        let cmd_examples = command_digest
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if cmd_examples.is_empty() {
+            String::new()
+        } else {
+            format!(" ({cmd_examples})")
+        };
+        parts.push(format!(
+            "Failed {total_error_count} command{}{suffix}",
+            if total_error_count != 1 { "s" } else { "" }
+        ));
+    } else if total_file_path_count > 0 && total_command_count > 0 {
+        let file_examples = file_path_digest
+            .iter()
+            .take(2)
+            .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cmd_examples = command_digest
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Edited {total_file_path_count} file{} ({file_examples}), ran {total_command_count} command{} ({cmd_examples})",
+            if total_file_path_count != 1 { "s" } else { "" },
+            if total_command_count != 1 { "s" } else { "" }
+        ));
     } else if total_file_path_count > 0 {
-        format!("Outcome: {status}; changed {total_file_path_count} file(s).")
+        let file_examples = file_path_digest
+            .iter()
+            .take(3)
+            .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Edited {total_file_path_count} file{} ({file_examples})",
+            if total_file_path_count != 1 { "s" } else { "" }
+        ));
     } else if total_command_count > 0 {
-        format!("Outcome: {status}; ran {total_command_count} command(s).")
+        let cmd_examples = command_digest
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Ran {total_command_count} command{} ({cmd_examples})",
+            if total_command_count != 1 { "s" } else { "" }
+        ));
+    } else if status == "completed" {
+        parts.push("Completed".to_string());
     } else {
-        format!("Outcome: {status}.")
-    };
-
-    if let Some(agent_message) = agent_message {
-        outcome.push_str(format!(" Agent: {agent_message}.").as_str());
+        parts.push(format!("Status: {status}"));
     }
 
-    let mut evidence_parts = Vec::new();
-    if let Some(command) = command_digest.first() {
-        evidence_parts.push(format!("command={command}"));
+    // Add agent message snippet
+    if let Some(msg) = agent_message {
+        let snippet: String = msg.chars().take(100).collect();
+        parts.push(snippet);
     }
-    if let Some(file_path) = file_path_digest.first() {
-        evidence_parts.push(format!("file={file_path}"));
-    }
-    if let Some(error) = error_digest.first() {
-        evidence_parts.push(format!("error={error}"));
-    }
-
-    let evidence = if evidence_parts.is_empty() {
-        "Evidence: none.".to_string()
-    } else {
-        format!("Evidence: {}.", evidence_parts.join(", "))
-    };
-
-    let mut lineage_parts = Vec::new();
-    if let Some(parent_turn_id) = parent_turn_id {
-        lineage_parts.push(format!("parent={parent_turn_id}"));
-    }
-    if let Some(child_turn_id) = child_turn_id {
-        lineage_parts.push(format!("child={child_turn_id}"));
-    }
-    if let Some(forked_from_thread_id) = forked_from_thread_id {
-        lineage_parts.push(format!("forked_from={forked_from_thread_id}"));
-    }
-    if started_after_rollback {
-        lineage_parts.push("started_after_rollback=true".to_string());
-    }
-    let lineage = if lineage_parts.is_empty() {
-        "Lineage: root or standalone turn.".to_string()
-    } else {
-        format!("Lineage: {}.", lineage_parts.join(", "))
-    };
 
     truncate_text(
-        format!("{outcome} {evidence} {lineage}").as_str(),
+        parts.join(". ").as_str(),
         TruncationPolicy::Bytes(SUMMARY_MAX_AGENT_MESSAGE_BYTES),
     )
 }
 
 fn is_structured_turn_summary(summary: &str) -> bool {
-    let normalized = summary.to_ascii_lowercase();
-    normalized.contains("outcome:")
-        && normalized.contains("evidence:")
-        && normalized.contains("lineage:")
+    !summary.trim().is_empty()
 }
 
 fn compact_command_evidence(
@@ -1134,6 +1153,7 @@ fn build_turn_summary_payload(
     parent_node_id: Option<String>,
     signal: &str,
     summary: String,
+    short_summary: Option<String>,
     parent_turn_id: Option<String>,
     child_turn_id: Option<String>,
     forked_from_thread_id: Option<String>,
@@ -1168,6 +1188,7 @@ fn build_turn_summary_payload(
                 "status": status,
                 "brief": {
                     "signal": signal,
+                    "short_summary": short_summary,
                     "agent_message": agent_message,
                     "primary_command": command_digest.first().cloned(),
                     "primary_file_path": file_path_digest.first().cloned(),
@@ -1305,6 +1326,7 @@ async fn persist_agentcanvas_turn_summaries(
             parent_node_id,
             signal.as_str(),
             compact_summary,
+            None, // short_summary
             parent_turn_id,
             child_turn_id,
             forked_from_thread_id,
@@ -1438,11 +1460,18 @@ async fn persist_agentcanvas_turn_summaries(
             omitted_error_count,
             compact_summary,
         } = persisted_turn_summary;
-        let summary_text = llm_summaries
-            .get(turn_id.as_str())
-            .and_then(|summary| normalize_summary_text(summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES))
+        let llm_result = llm_summaries.get(turn_id.as_str());
+        let summary_text = llm_result
+            .and_then(|r| {
+                normalize_summary_text(&r.detail_summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
+            })
             .filter(|summary| is_structured_turn_summary(summary))
             .unwrap_or(compact_summary);
+        let llm_short_summary = llm_result
+            .and_then(|r| {
+                normalize_summary_text(&r.short_summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
+            })
+            .filter(|s| is_structured_turn_summary(s));
         let summary = build_turn_summary_payload(
             thread_id,
             turn_id.as_str(),
@@ -1451,6 +1480,7 @@ async fn persist_agentcanvas_turn_summaries(
             parent_node_id,
             signal.as_str(),
             summary_text,
+            llm_short_summary,
             parent_turn_id,
             child_turn_id,
             forked_from_thread_id,
@@ -1540,10 +1570,10 @@ async fn persist_agentcanvas_turn_summaries(
                 compact_summary,
             } = phase_summary;
             let phase_node_id = format!("phase:{phase_id}");
-            let summary_text = phase_llm_summaries
-                .get(phase_id.as_str())
-                .and_then(|summary| {
-                    normalize_summary_text(summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
+            let phase_llm_result = phase_llm_summaries.get(phase_id.as_str());
+            let summary_text = phase_llm_result
+                .and_then(|r| {
+                    normalize_summary_text(&r.detail_summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
                 })
                 .filter(|summary| is_structured_turn_summary(summary))
                 .unwrap_or(compact_summary);
@@ -1562,6 +1592,7 @@ async fn persist_agentcanvas_turn_summaries(
                         "status": status,
                         "brief": {
                             "signal": signal,
+                            "short_summary": phase_llm_result.map(|r| r.short_summary.clone()),
                             "agent_message": serde_json::Value::Null,
                             "primary_command": command_digest.first().cloned(),
                             "primary_file_path": file_path_digest.first().cloned(),

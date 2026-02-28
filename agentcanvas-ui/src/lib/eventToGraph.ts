@@ -15,46 +15,52 @@ const SUMMARY_LABEL_MAX = 80
  * Extract a short, human-readable label from a SummaryNodeEvent.
  *
  * Priority:
- * 1. Agent message from brief (most meaningful for display)
- * 2. Short extract from summaryText (skip verbose "Outcome:/Evidence:/Lineage:" boilerplate)
- * 3. Primary evidence (command, file, or error)
- * 4. Status-based fallback
+ * 1. LLM short_summary (if available in brief)
+ * 2. Auto-generated action label from counts + evidence
+ * 3. Primary evidence (command, file, error)
+ * 4. Agent message snippet (last resort)
  */
 function extractSummaryLabel(event: SummaryNodeEvent): string {
-  // 1. Agent message is the best short label
-  const agentMsg = event.brief.agentMessage?.trim()
-  if (agentMsg) return agentMsg.slice(0, SUMMARY_LABEL_MAX)
+  // 1. LLM short_summary from brief
+  const shortSummary = event.brief.shortSummary?.trim()
+  if (shortSummary) return shortSummary.slice(0, SUMMARY_LABEL_MAX)
 
-  // 2. Try to extract the useful part from summaryText
-  const text = event.summaryText?.trim() ?? ''
-  if (text) {
-    // If it starts with "Outcome:" it's a compact summary — extract the Agent: part if present
-    const agentMatch = text.match(/Agent:\s*(.+?)(?:\.\s*Evidence:|$)/i)
-    if (agentMatch?.[1]?.trim()) return agentMatch[1].trim().slice(0, SUMMARY_LABEL_MAX)
-
-    // Extract the Outcome: part as fallback
-    const outcomeMatch = text.match(/Outcome:\s*(.+?)(?:\.\s*Evidence:|$)/i)
-    if (outcomeMatch?.[1]?.trim()) return outcomeMatch[1].trim().slice(0, SUMMARY_LABEL_MAX)
-
-    // Not a structured format — use it directly if short enough
-    if (!text.includes('Evidence:') && !text.includes('Lineage:')) {
-      return text.slice(0, SUMMARY_LABEL_MAX)
-    }
+  // 2. Auto-generated action label from counts + evidence
+  const { commandsTotal, filePathsTotal, errorsTotal } = event.counts
+  if (errorsTotal > 0) {
+    const errSnippet = event.brief.primaryError?.slice(0, 40) ?? ''
+    return errSnippet
+      ? `Failed: ${errSnippet}`
+      : `Build failed (${errorsTotal} error${errorsTotal !== 1 ? 's' : ''})`
+  }
+  if (filePathsTotal > 0 && commandsTotal > 0) {
+    return `Edited ${filePathsTotal} file${filePathsTotal !== 1 ? 's' : ''}, ran ${commandsTotal} command${commandsTotal !== 1 ? 's' : ''}`
+  }
+  if (filePathsTotal > 0) {
+    const fileSnippet = event.brief.primaryFilePath?.split('/').pop() ?? ''
+    return fileSnippet
+      ? `Edited ${filePathsTotal} file${filePathsTotal !== 1 ? 's' : ''} (${fileSnippet})`
+      : `Edited ${filePathsTotal} file${filePathsTotal !== 1 ? 's' : ''}`
+  }
+  if (commandsTotal > 0) {
+    const cmdSnippet = event.brief.primaryCommand?.slice(0, 30) ?? ''
+    return cmdSnippet
+      ? `Ran ${commandsTotal} command${commandsTotal !== 1 ? 's' : ''} (${cmdSnippet})`
+      : `Ran ${commandsTotal} command${commandsTotal !== 1 ? 's' : ''}`
   }
 
-  // 3. Primary evidence
+  // 3. Primary evidence fallback
   if (event.brief.primaryError) return `Error: ${event.brief.primaryError.slice(0, 60)}`
   if (event.brief.primaryCommand) return `$ ${event.brief.primaryCommand.slice(0, 60)}`
   if (event.brief.primaryFilePath) return event.brief.primaryFilePath.slice(0, 60)
 
-  // 4. Status fallback — human-readable
-  const signalLabels: Record<string, string> = {
-    error: 'Failed',
-    code_changes: 'Code changes',
-    execution: 'Commands executed',
-    status_only: event.status === 'completed' ? 'Completed' : event.status ?? 'Done',
-  }
-  return signalLabels[event.brief.signal] ?? 'Summary'
+  // 4. Agent message snippet (last resort)
+  const agentMsg = event.brief.agentMessage?.trim()
+  if (agentMsg) return agentMsg.slice(0, SUMMARY_LABEL_MAX)
+
+  // 5. Status fallback
+  if (event.status === 'completed') return 'Completed'
+  return event.status ?? 'Summary'
 }
 
 export function buildGraph(events: AppEvent[]): GraphResult {
@@ -149,7 +155,8 @@ export function buildGraph(events: AppEvent[]): GraphResult {
               : 'success'
       if (event.nodeType === 'phase') {
         const phaseNodeId = `phase-${event.id}`
-        const phaseLabel = event.summaryText.trim()
+        const phaseLabel = event.brief.shortSummary?.trim()
+          || extractSummaryLabel(event)
           || `Phase (${event.lineage.childTurnIds.length} turn${event.lineage.childTurnIds.length === 1 ? '' : 's'})`
         const existingPhaseNode = nodes.find(n => n.id === phaseNodeId)
         if (existingPhaseNode) {

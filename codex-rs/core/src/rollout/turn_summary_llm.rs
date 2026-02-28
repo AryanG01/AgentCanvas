@@ -20,13 +20,20 @@ const TURN_SUMMARY_HARD_MAX_TOKENS: u16 = 2_048;
 const TURN_SUMMARY_LLM_TIMEOUT_SECS: u64 = 15;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "\
-You are generating high-signal hierarchical summaries for coding-agent turns.
-Each input object includes direct turn evidence plus parent/child snapshots.
-For each turn summary, use this exact format:
-Outcome: <primary result>. Evidence: <key commands/files/errors>. Lineage: <parent/child/fork/rollback context>.
-Keep summaries concise and concrete (1-3 short sentences), do not invent facts, and
-prioritize failures or behavior changes before generic status text.
-Return a JSON array where each item has fields `turn_id` and `summary`.
+You summarize coding-agent turns into action-oriented prose.
+Lead with the primary action verb: Edited, Ran, Fixed, Searched, Debugged, Read, Created, Deleted, Installed, Built, Tested.
+Include specific files/commands when they are the point of the turn.
+Mention errors prominently if they occurred.
+Return a JSON array where each item has:
+  \"turn_id\": the turn identifier,
+  \"short_summary\": action-oriented label, max 80 chars (for graph node display),
+  \"detail_summary\": expanded detail, max 250 chars (for evidence panel).
+Examples:
+  short_summary: \"Explored project structure via pwd, ls, find\"
+  detail_summary: \"Ran 4 commands to locate portfolio project. Used find with rg to search directories.\"
+  short_summary: \"Edited 2 test files, fixed assertion\"
+  detail_summary: \"Fixed failing test in src/lib.test.ts by updating expected value.\"
+Do not invent facts. Prioritize errors and failures over status text.
 Return ONLY JSON, no markdown fences, no extra text.";
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,7 +85,21 @@ pub(crate) enum TurnSummaryLlmError {
 #[derive(Debug, Deserialize)]
 struct SummaryItem {
     turn_id: String,
-    summary: String,
+    #[serde(default)]
+    short_summary: Option<String>,
+    #[serde(default)]
+    detail_summary: Option<String>,
+    /// Legacy field — used as fallback when short/detail not present.
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LlmSummaryResult {
+    /// Short action-oriented label (max ~80 chars) for graph node display.
+    pub(crate) short_summary: String,
+    /// Expanded detail (max ~250 chars) for evidence panel.
+    pub(crate) detail_summary: String,
 }
 
 pub(crate) fn build_turn_summary_prompt(turns: &[TurnSummaryEvidence]) -> String {
@@ -87,7 +108,7 @@ pub(crate) fn build_turn_summary_prompt(turns: &[TurnSummaryEvidence]) -> String
 
 pub(crate) async fn generate_turn_summaries(
     turns: &[TurnSummaryEvidence],
-) -> Result<BTreeMap<String, String>, TurnSummaryLlmError> {
+) -> Result<BTreeMap<String, LlmSummaryResult>, TurnSummaryLlmError> {
     if turns.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -139,7 +160,21 @@ pub(crate) async fn generate_turn_summaries(
     let items = parse_summary_items(raw).map_err(TurnSummaryLlmError::Parse)?;
     let mut map = BTreeMap::new();
     for item in items {
-        map.insert(item.turn_id, item.summary);
+        let short = item
+            .short_summary
+            .or(item.summary.clone())
+            .unwrap_or_default();
+        let detail = item
+            .detail_summary
+            .or(item.summary)
+            .unwrap_or_default();
+        map.insert(
+            item.turn_id,
+            LlmSummaryResult {
+                short_summary: short,
+                detail_summary: detail,
+            },
+        );
     }
     Ok(map)
 }

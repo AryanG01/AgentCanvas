@@ -163,6 +163,7 @@ export function useAppServerWS(overrideUrl?: string) {
               summaryText: (node.summary as string) ?? '',
               brief: {
                 signal: (brief.signal as string) ?? 'status_only',
+                shortSummary: (brief.short_summary as string) ?? null,
                 agentMessage: (brief.agent_message as string) ?? null,
                 primaryCommand: (brief.primary_command as string) ?? null,
                 primaryFilePath: (brief.primary_file_path as string) ?? null,

@@ -85,13 +85,20 @@ const SUMMARY_LLM_MAX_TOKENS = 2048;
 const SUMMARY_LLM_TIMEOUT_MS = 15_000;
 
 const SUMMARY_SYSTEM_PROMPT = `\
-You are generating high-signal hierarchical summaries for coding-agent turns.
-Each input object includes direct turn evidence plus parent/child snapshots.
-For each turn summary, use this exact format:
-Outcome: <primary result>. Evidence: <key commands/files/errors>. Lineage: <parent/child/fork/rollback context>.
-Keep summaries concise and concrete (1-3 short sentences), do not invent facts, and
-prioritize failures or behavior changes before generic status text.
-Return a JSON array where each item has fields \`turn_id\` and \`summary\`.
+You summarize coding-agent turns into action-oriented prose.
+Lead with the primary action verb: Edited, Ran, Fixed, Searched, Debugged, Read, Created, Deleted, Installed, Built, Tested.
+Include specific files/commands when they are the point of the turn.
+Mention errors prominently if they occurred.
+Return a JSON array where each item has:
+  "turn_id": the turn identifier,
+  "short_summary": action-oriented label, max 80 chars (for graph node display),
+  "detail_summary": expanded detail, max 250 chars (for evidence panel).
+Examples:
+  short_summary: "Explored project structure via pwd, ls, find"
+  detail_summary: "Ran 4 commands to locate portfolio project. Used find with rg to search directories, confirmed working directory with pwd and ls."
+  short_summary: "Edited 2 test files, fixed assertion"
+  detail_summary: "Fixed failing test in src/lib.test.ts by updating expected value. Also edited src/utils.test.ts to add missing import."
+Do not invent facts. Prioritize errors and failures over status text.
 Return ONLY JSON, no markdown fences, no extra text.`;
 
 function sanitizePathComponent(value) {
@@ -381,36 +388,33 @@ function computeSignal(evidence) {
 
 function buildCompactSummary(turnId, evidence) {
   const { commands, filePaths, errors, agentMessage, status } = evidence;
-  let outcome;
+  const parts = [];
+
+  // Lead with action verb + specifics
   if (errors.length > 0) {
-    outcome = `Outcome: ${status}; encountered ${errors.length} error(s).`;
+    const cmdExamples = commands.slice(0, 2).join(", ");
+    parts.push(`Failed ${errors.length} command${errors.length !== 1 ? "s" : ""}${cmdExamples ? ` (${cmdExamples})` : ""}`);
+  } else if (filePaths.length > 0 && commands.length > 0) {
+    const fileExamples = filePaths.slice(0, 2).map(f => f.split("/").pop()).join(", ");
+    const cmdExamples = commands.slice(0, 2).join(", ");
+    parts.push(`Edited ${filePaths.length} file${filePaths.length !== 1 ? "s" : ""} (${fileExamples}), ran ${commands.length} command${commands.length !== 1 ? "s" : ""} (${cmdExamples})`);
   } else if (filePaths.length > 0) {
-    outcome = `Outcome: ${status}; changed ${filePaths.length} file(s).`;
+    const fileExamples = filePaths.slice(0, 3).map(f => f.split("/").pop()).join(", ");
+    parts.push(`Edited ${filePaths.length} file${filePaths.length !== 1 ? "s" : ""} (${fileExamples})`);
   } else if (commands.length > 0) {
-    outcome = `Outcome: ${status}; ran ${commands.length} command(s).`;
+    const cmdExamples = commands.slice(0, 3).join(", ");
+    parts.push(`Ran ${commands.length} command${commands.length !== 1 ? "s" : ""} (${cmdExamples})`);
   } else {
-    outcome = `Outcome: ${status}.`;
+    parts.push(status === "completed" ? "Completed" : `Status: ${status}`);
   }
+
+  // Add agent message snippet
   if (agentMessage) {
-    const snippet = agentMessage.replace(/\s+/g, " ").trim().slice(0, 120);
-    outcome += ` Agent: ${snippet}.`;
+    const snippet = agentMessage.replace(/\s+/g, " ").trim().slice(0, 100);
+    parts.push(snippet);
   }
 
-  const evidenceParts = [];
-  if (commands[0]) evidenceParts.push(`command=${commands[0]}`);
-  if (filePaths[0]) evidenceParts.push(`file=${filePaths[0]}`);
-  if (errors[0]) evidenceParts.push(`error=${errors[0]}`);
-  const evidenceStr = evidenceParts.length > 0
-    ? `Evidence: ${evidenceParts.join(", ")}.`
-    : "Evidence: none.";
-
-  const lineageParts = [];
-  if (evidence.parentTurnId) lineageParts.push(`parent=${evidence.parentTurnId}`);
-  const lineage = lineageParts.length > 0
-    ? `Lineage: ${lineageParts.join(", ")}.`
-    : "Lineage: root or standalone turn.";
-
-  return `${outcome} ${evidenceStr} ${lineage}`.slice(0, MAX_SYNTHETIC_SUMMARY_CHARS);
+  return parts.join(". ").slice(0, MAX_SYNTHETIC_SUMMARY_CHARS);
 }
 
 function buildEvidenceBasedSummaryNode(threadId, turnId, evidence) {
@@ -547,8 +551,11 @@ async function generateLLMSummaries(turnEvidence) {
 
     const result = new Map();
     for (const item of items) {
-      if (item.turn_id && item.summary) {
-        result.set(item.turn_id, item.summary);
+      if (item.turn_id && (item.short_summary || item.detail_summary || item.summary)) {
+        result.set(item.turn_id, {
+          short: item.short_summary || item.summary || "",
+          detail: item.detail_summary || item.summary || "",
+        });
       }
     }
     console.log(`[summary] Got LLM summaries for ${result.size} turn(s)`);
@@ -560,8 +567,7 @@ async function generateLLMSummaries(turnEvidence) {
 }
 
 function isStructuredSummary(text) {
-  const lower = text.toLowerCase();
-  return lower.includes("outcome:") && lower.includes("evidence:") && lower.includes("lineage:");
+  return typeof text === "string" && text.trim().length > 0;
 }
 
 function buildReplayMessages(rolloutLines) {
@@ -1072,13 +1078,20 @@ async function enhanceWithLLM(result) {
       const m = msg.msg;
       if (m.method !== "agentcanvas/summaryNode") continue;
       const turnId = m.params?.turnId;
-      const llmText = llmSummaries.get(turnId);
-      if (!llmText || !isStructuredSummary(llmText)) continue;
+      const llmResult = llmSummaries.get(turnId);
+      if (!llmResult) continue;
 
-      // Replace the summary text in the node
       const node = m.params.node;
       if (node) {
-        node.summary = llmText;
+        // Use detail_summary as the main summary text
+        if (isStructuredSummary(llmResult.detail)) {
+          node.summary = llmResult.detail;
+        }
+        // Embed short_summary into brief for graph label extraction
+        if (isStructuredSummary(llmResult.short)) {
+          if (!node.brief) node.brief = {};
+          node.brief.short_summary = llmResult.short;
+        }
       }
     }
   }

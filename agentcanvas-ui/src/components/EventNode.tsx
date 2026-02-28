@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
-import type { GraphNodeData, NodeKind } from '../lib/types'
+import type { GraphNodeData, NodeKind, SummaryNodeEvent } from '../lib/types'
 
 type GraphNode = Node<GraphNodeData>
 
@@ -78,12 +78,30 @@ const kindConfig: Record<NodeKind, KindConfig> = {
   },
 }
 
+function MiniStats({ event }: { event: SummaryNodeEvent }) {
+  const { commandsTotal, filePathsTotal, errorsTotal } = event.counts
+  if (commandsTotal === 0 && filePathsTotal === 0 && errorsTotal === 0) return null
+  const parts: string[] = []
+  if (commandsTotal > 0) parts.push(`⌘${commandsTotal}`)
+  if (filePathsTotal > 0) parts.push(`◇${filePathsTotal}`)
+  if (errorsTotal > 0) parts.push(`✕${errorsTotal}`)
+  return (
+    <span className="text-[10px] text-zinc-500 font-mono leading-none mt-0.5 block">
+      {parts.join(' ')}
+    </span>
+  )
+}
+
 export const EventNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
   const cfg = kindConfig[data.kind]
+  const isSummaryLike = data.kind === 'summary' || data.kind === 'phase'
+  const width = isSummaryLike ? 'w-[240px]' : 'w-[210px]'
+  const summaryEvent = isSummaryLike ? (data.rawEvent as SummaryNodeEvent) : null
+
   return (
     <div
       className={`
-        w-[210px] rounded-lg border px-3 py-2 shadow-lg
+        ${width} rounded-lg border px-3 py-2 shadow-lg
         bg-zinc-800/90 backdrop-blur-sm text-white
         transition-all duration-150
         ${selected ? 'border-indigo-400 shadow-indigo-500/20 shadow-xl' : cfg.border}
@@ -111,9 +129,10 @@ export const EventNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
               <span className="text-[9px] text-red-400">failed</span>
             )}
           </div>
-          <p className="text-xs text-zinc-200 leading-tight truncate font-mono">
+          <p className={`text-xs text-zinc-200 leading-tight font-mono ${isSummaryLike ? 'line-clamp-2' : 'truncate'}`}>
             {data.label}
           </p>
+          {summaryEvent && <MiniStats event={summaryEvent} />}
         </div>
       </div>
 

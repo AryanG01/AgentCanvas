@@ -82,6 +82,7 @@ export interface SummaryNodeEvent {
   summaryText: string
   brief: {
     signal: string
+    shortSummary: string | null
     agentMessage: string | null
     primaryCommand: string | null
     primaryFilePath: string | null

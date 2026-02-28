@@ -44,9 +44,10 @@ const summaryNode: AppEvent = {
   turnId: 't1',
   nodeType: 'turn',
   status: 'completed',
-  summaryText: 'status=completed; signal=execution; command=cargo test -p codex-core',
+  summaryText: 'Ran 1 command (cargo test -p codex-core)',
   brief: {
     signal: 'execution',
+    shortSummary: null,
     agentMessage: null,
     primaryCommand: 'cargo test -p codex-core',
     primaryFilePath: null,
@@ -99,9 +100,10 @@ const phaseSummaryNode: AppEvent = {
   turnId: 't2',
   nodeType: 'phase',
   status: 'completed',
-  summaryText: 'Outcome: fixed regression. Evidence: edited tests. Lineage: grouped turns.',
+  summaryText: 'Fixed regression by editing tests and running cargo test.',
   brief: {
     signal: 'execution',
+    shortSummary: 'Fixed regression in tests',
     agentMessage: null,
     primaryCommand: 'cargo test -p codex-core',
     primaryFilePath: 'core/src/lib.rs',
