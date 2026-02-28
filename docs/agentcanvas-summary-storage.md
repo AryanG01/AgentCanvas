@@ -16,6 +16,7 @@ AgentCanvas session summaries.
   - `summary_node_commands`
   - `summary_node_errors`
   - `summary_node_semantic_terms`
+  - `summary_node_embeddings`
 
 ## Runtime API
 
@@ -37,6 +38,7 @@ AgentCanvas session summaries.
   - `search_summary_nodes_by_command_substring(...)`
   - `search_summary_nodes_by_error_text(...)`
   - `search_summary_nodes_by_semantic_text(...)`
+  - `search_summary_nodes_by_hybrid_text(...)`
 
 ## Core integration
 
@@ -78,9 +80,13 @@ All query methods return indexed node matches with:
     `stderr`
 - Semantic indexing is lightweight/local:
   - configured embedding model id: `jina-embeddings-v5-text-nano`.
-  - builds sparse hashed token vectors from node metadata/evidence text.
-  - stores normalized term weights in SQLite (`summary_node_semantic_terms`).
-  - query-time cosine scoring is computed via SQL join against query terms.
+  - sparse fallback index: hashed token vectors stored in `summary_node_semantic_terms`.
+  - dense embeddings (when `JINA_API_KEY` is set): persisted in
+    `summary_node_embeddings` as vector BLOB + norm metadata.
+  - semantic search prefers dense Jina embeddings and falls back to sparse SQL
+    cosine-style matching when dense embeddings are unavailable.
+  - hybrid search combines semantic score and lexical score from file/command/error/title
+    matches into a final rank score.
 
 ## Update semantics
 
