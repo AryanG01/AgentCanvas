@@ -17,12 +17,37 @@
  * session. Without ?file=, replays the CLI-specified or latest file.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { WebSocketServer } from "ws";
+
+// Load .env.local from repo root (Node doesn't read Vite env files)
+const __dirname = dirname(fileURLToPath(import.meta.url));
+for (const envFile of [".env.local", ".env"]) {
+  // Check both agentcanvas-ui/ and repo root
+  for (const base of [join(__dirname, ".."), join(__dirname, "..", "..")]) {
+    const envPath = join(base, envFile);
+    if (existsSync(envPath)) {
+      for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq === -1) continue;
+        const key = trimmed.slice(0, eq).trim();
+        let val = trimmed.slice(eq + 1).trim();
+        // Strip surrounding quotes
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (!process.env[key]) process.env[key] = val;
+      }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing

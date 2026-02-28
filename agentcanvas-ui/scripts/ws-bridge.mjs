@@ -19,10 +19,33 @@
 import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import { spawn } from 'child_process'
-import { readFileSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
 import * as readline from 'readline'
+
+// Load .env.local from repo root (Node doesn't read Vite env files)
+const __dirname = dirname(fileURLToPath(import.meta.url))
+for (const envFile of ['.env.local', '.env']) {
+  for (const base of [join(__dirname, '..'), join(__dirname, '..', '..')]) {
+    const envPath = join(base, envFile)
+    if (existsSync(envPath)) {
+      for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) continue
+        const eq = trimmed.indexOf('=')
+        if (eq === -1) continue
+        const key = trimmed.slice(0, eq).trim()
+        let val = trimmed.slice(eq + 1).trim()
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1)
+        }
+        if (!process.env[key]) process.env[key] = val
+      }
+    }
+  }
+}
 
 // ── Parse CLI args ────────────────────────────────────────────────────────────
 const args = process.argv.slice(2)
