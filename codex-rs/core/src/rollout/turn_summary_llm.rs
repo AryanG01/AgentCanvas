@@ -73,6 +73,7 @@ pub(crate) async fn generate_turn_summaries(
     }
     if std::env::var("OPENAI_API_KEY")
         .ok()
+        .as_deref()
         .is_none_or(str::is_empty)
     {
         return Err(TurnSummaryLlmError::MissingApiKey);
