@@ -935,7 +935,7 @@ fn build_compact_turn_summary(
     } else if total_command_count > 0 {
         format!("Outcome: {status}; ran {total_command_count} command(s).")
     } else {
-        format!("Outcome: {status}; signal {signal}.")
+        format!("Outcome: {status}.")
     };
 
     if let Some(agent_message) = agent_message {
@@ -954,7 +954,7 @@ fn build_compact_turn_summary(
     }
 
     let evidence = if evidence_parts.is_empty() {
-        "Evidence: no indexed command/file/error snippets.".to_string()
+        "Evidence: none.".to_string()
     } else {
         format!("Evidence: {}.", evidence_parts.join(", "))
     };

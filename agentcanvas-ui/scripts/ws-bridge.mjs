@@ -45,7 +45,11 @@ function normalizeSummaryText(value) {
 
 function makeFallbackSummaryNode(threadId, turnId, status, summaryText = '') {
   const normalized = normalizeSummaryText(summaryText)
-  const brief = normalized || `${status} turn`
+  // Build a human-readable summary: prefer the agent message, fall back to status
+  const agentSnippet = normalized ? normalized.slice(0, 120) : null
+  const displaySummary = agentSnippet
+    ? `Outcome: ${status}. Agent: ${agentSnippet}`
+    : `Outcome: ${status}.`
 
   return {
     schema_version: 'agentcanvas.turn.v2',
@@ -59,14 +63,14 @@ function makeFallbackSummaryNode(threadId, turnId, status, summaryText = '') {
         parent_id: null,
         node_type: 'turn',
         title: `Turn ${turnId}`,
-        summary: brief,
+        summary: displaySummary,
         status,
         brief: {
           signal: status === 'interrupted' ? 'error' : 'status_only',
-          agent_message: brief,
+          agent_message: agentSnippet,
           primary_command: null,
           primary_file_path: null,
-          primary_error: status === 'interrupted' ? brief : null,
+          primary_error: status === 'interrupted' ? (agentSnippet || 'interrupted') : null,
         },
         lineage: {
           parent_turn_id: null,
@@ -122,7 +126,23 @@ function readTurnSummaryNode(threadIdValue, turnIdValue) {
 
 function extractAgentMessage(item) {
   if (!item || typeof item !== 'object') return null
+  // Handle normalized format
   if (item.type === 'agentMessage' && typeof item.text === 'string') return item.text
+  // Handle protocol format: message item with role=assistant and text content
+  if (item.type === 'message' && item.role === 'assistant') {
+    const content = Array.isArray(item.content) ? item.content : []
+    const textPart = content.find((c) => c?.type === 'output_text' || c?.type === 'text')
+    if (textPart?.text) return textPart.text
+  }
+  // Handle codex proto format: response items with content array
+  if (Array.isArray(item.content)) {
+    for (const part of item.content) {
+      if (part?.type === 'output_text' && typeof part.text === 'string') return part.text
+      if (part?.type === 'text' && typeof part.text === 'string') return part.text
+    }
+  }
+  // Handle simple message field (codex proto agent_message event)
+  if (typeof item.message === 'string' && item.message.trim()) return item.message
   return null
 }
 
@@ -189,31 +209,65 @@ rl.on('line', (line) => {
   if (msg.method === 'turn/completed') {
     const completedTurnId = msg.params?.turn?.id ?? turnId
     const status = msg.params?.turn?.status ?? 'completed'
-    const persisted = readTurnSummaryNode(threadId, completedTurnId)
-    const messageText = completedTurnId ? turnCompletedAgentMessages.get(completedTurnId) : null
-    const summaryNode = persisted
-      ?? makeFallbackSummaryNode(threadId ?? '', completedTurnId, status, messageText ?? '')
+    // The turn/completed event may carry last_agent_message directly (from the protocol)
+    const turnLastMessage = msg.params?.turn?.lastAgentMessage
+      ?? msg.params?.turn?.last_agent_message
+      ?? msg.params?.lastAgentMessage
+      ?? msg.params?.last_agent_message
+      ?? null
+    const messageText = turnLastMessage
+      ?? (completedTurnId ? turnCompletedAgentMessages.get(completedTurnId) : null)
     if (completedTurnId) {
       turnCompletedAgentMessages.delete(completedTurnId)
     }
-    if (summaryNode) {
+    // The recorder persists summaries asynchronously after emitting turn/completed.
+    // Retry reading the persisted summary with a short delay to avoid the race.
+    const emitSummary = (node) => {
+      if (!node) return
       broadcast({
         method: 'agentcanvas/summaryNode',
         params: {
           threadId: threadId ?? '',
           turnId: completedTurnId ?? '',
-          node: summaryNode,
+          node,
         },
       })
+    }
+    const persisted = readTurnSummaryNode(threadId, completedTurnId)
+    if (persisted) {
+      emitSummary(persisted)
+    } else {
+      // Emit an immediate fallback so the UI isn't empty
+      const fallback = makeFallbackSummaryNode(threadId ?? '', completedTurnId, status, messageText ?? '')
+      emitSummary(fallback?.nodes?.[0] ?? fallback)
+      // Then retry after a delay to pick up the persisted (potentially LLM-enhanced) summary
+      setTimeout(() => {
+        const delayed = readTurnSummaryNode(threadId, completedTurnId)
+        if (delayed) emitSummary(delayed)
+      }, 3000)
     }
   }
 
   if (msg.method === 'item/completed') {
     const item = msg.params?.item
-    const itemTurnId = msg.params?.turnId
+    const itemTurnId = msg.params?.turnId ?? turnId
     const text = extractAgentMessage(item)
     if (itemTurnId && text) {
       turnCompletedAgentMessages.set(itemTurnId, text)
+    }
+  }
+
+  // Also capture agent messages from codex/event/* notifications (proto transport)
+  if (msg.method?.startsWith('codex/event/')) {
+    const eventMsg = msg.params?.msg ?? msg.params
+    // task_complete carries last_agent_message
+    if (eventMsg?.last_agent_message && turnId) {
+      turnCompletedAgentMessages.set(turnId, eventMsg.last_agent_message)
+    }
+    // Raw response items may contain agent message text
+    if (eventMsg?.item) {
+      const text = extractAgentMessage(eventMsg.item)
+      if (turnId && text) turnCompletedAgentMessages.set(turnId, text)
     }
   }
 

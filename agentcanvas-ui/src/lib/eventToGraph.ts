@@ -1,5 +1,5 @@
 import type { Node, Edge } from '@xyflow/react'
-import type { AppEvent, CommandExecutionEvent, GraphNodeData } from './types'
+import type { AppEvent, CommandExecutionEvent, GraphNodeData, SummaryNodeEvent } from './types'
 
 type GraphNode = Node<GraphNodeData>
 
@@ -7,6 +7,54 @@ export interface GraphResult {
   nodes: GraphNode[]
   edges: Edge[]
   turnOrder: string[]  // ordered list of turnIds for sequential flow edges
+}
+
+const SUMMARY_LABEL_MAX = 80
+
+/**
+ * Extract a short, human-readable label from a SummaryNodeEvent.
+ *
+ * Priority:
+ * 1. Agent message from brief (most meaningful for display)
+ * 2. Short extract from summaryText (skip verbose "Outcome:/Evidence:/Lineage:" boilerplate)
+ * 3. Primary evidence (command, file, or error)
+ * 4. Status-based fallback
+ */
+function extractSummaryLabel(event: SummaryNodeEvent): string {
+  // 1. Agent message is the best short label
+  const agentMsg = event.brief.agentMessage?.trim()
+  if (agentMsg) return agentMsg.slice(0, SUMMARY_LABEL_MAX)
+
+  // 2. Try to extract the useful part from summaryText
+  const text = event.summaryText?.trim() ?? ''
+  if (text) {
+    // If it starts with "Outcome:" it's a compact summary — extract the Agent: part if present
+    const agentMatch = text.match(/Agent:\s*(.+?)(?:\.\s*Evidence:|$)/i)
+    if (agentMatch?.[1]?.trim()) return agentMatch[1].trim().slice(0, SUMMARY_LABEL_MAX)
+
+    // Extract the Outcome: part as fallback
+    const outcomeMatch = text.match(/Outcome:\s*(.+?)(?:\.\s*Evidence:|$)/i)
+    if (outcomeMatch?.[1]?.trim()) return outcomeMatch[1].trim().slice(0, SUMMARY_LABEL_MAX)
+
+    // Not a structured format — use it directly if short enough
+    if (!text.includes('Evidence:') && !text.includes('Lineage:')) {
+      return text.slice(0, SUMMARY_LABEL_MAX)
+    }
+  }
+
+  // 3. Primary evidence
+  if (event.brief.primaryError) return `Error: ${event.brief.primaryError.slice(0, 60)}`
+  if (event.brief.primaryCommand) return `$ ${event.brief.primaryCommand.slice(0, 60)}`
+  if (event.brief.primaryFilePath) return event.brief.primaryFilePath.slice(0, 60)
+
+  // 4. Status fallback — human-readable
+  const signalLabels: Record<string, string> = {
+    error: 'Failed',
+    code_changes: 'Code changes',
+    execution: 'Commands executed',
+    status_only: event.status === 'completed' ? 'Completed' : event.status ?? 'Done',
+  }
+  return signalLabels[event.brief.signal] ?? 'Summary'
 }
 
 export function buildGraph(events: AppEvent[]): GraphResult {
@@ -142,8 +190,9 @@ export function buildGraph(events: AppEvent[]): GraphResult {
       } else {
         const turnNode = nodes.find(n => n.id === `turn-${event.turnId}`)
         if (turnNode) {
-          if (turnNode.data.label === '(typing…)' && event.summaryText.trim()) {
-            turnNode.data = { ...turnNode.data, label: event.summaryText }
+          const extractedLabel = extractSummaryLabel(event)
+          if (turnNode.data.label === '(typing…)' && extractedLabel) {
+            turnNode.data = { ...turnNode.data, label: extractedLabel }
           }
           if (event.status === 'rolled_back') {
             turnNode.data = { ...turnNode.data, status: 'cancelled' }
@@ -151,9 +200,7 @@ export function buildGraph(events: AppEvent[]): GraphResult {
         }
 
         const summaryNodeId = `summary-${event.turnId}`
-        const summaryLabel = event.summaryText.trim()
-          || event.brief.agentMessage?.trim()
-          || `${event.brief.signal} summary`
+        const summaryLabel = extractSummaryLabel(event)
         const existingSummaryNode = nodes.find(n => n.id === summaryNodeId)
         if (existingSummaryNode) {
           existingSummaryNode.data = {
