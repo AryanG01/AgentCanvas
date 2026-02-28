@@ -29,7 +29,7 @@ pub async fn spawn_http_server(
     }
 
     let app = Router::new()
-        .nest_service("/", ServeDir::new(&dist_path));
+        .fallback_service(ServeDir::new(&dist_path));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(&addr)
