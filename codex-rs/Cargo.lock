@@ -2362,6 +2362,7 @@ dependencies = [
  "log",
  "owo-colors",
  "pretty_assertions",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
