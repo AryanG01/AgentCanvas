@@ -22,6 +22,8 @@ function AppInner() {
   // Always call both hooks unconditionally (React Rules of Hooks), but pass null to disable the inactive one
   const jsonlUrl = USE_JSONL ? undefined : null  // undefined = use store default, null = disable
   const appServerUrl = USE_JSONL ? null : undefined  // null = disable, undefined = use store default
+  console.log('[App] USE_JSONL:', USE_JSONL)
+  console.log('[App] jsonlUrl:', jsonlUrl)
 
   useCodexJsonlWS(jsonlUrl)   // Always called, but null disables it
   useAppServerWS(appServerUrl) // Always called, but null disables it

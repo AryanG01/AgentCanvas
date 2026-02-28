@@ -161,10 +161,22 @@ export function useCodexJsonlWS(overrideUrl?: string | null) {
   const currentTurnId = useRef<string | null>(null)
   const currentThreadId = useRef<string | null>(null)
   const url = overrideUrl === null ? null : (overrideUrl ?? storeUrl)
+  console.log('[useCodexJsonlWS] DEBUG:', { overrideUrl, storeUrl, calculatedUrl: url })
 
   useEffect(() => {
-    if (url === null) return  // Disabled
-    if (!url) return // no URL yet
+    console.log('[useCodexJsonlWS Effect] url:', url, 'truthy:', !!url)
+
+    if (url === null) {
+      console.log('[useCodexJsonlWS] EARLY RETURN: url is null (disabled)')
+      return  // Disabled
+    }
+
+    if (!url) {
+      console.log('[useCodexJsonlWS] EARLY RETURN: url is falsy')
+      return // no URL yet
+    }
+
+    console.log('[useCodexJsonlWS] Connecting to:', url)
 
     unmountedRef.current = false
 

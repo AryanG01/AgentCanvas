@@ -2,6 +2,7 @@ use codex_exec::event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use codex_core::CodexThread;
 use futures::stream::StreamExt;
 use futures::SinkExt;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,9 @@ pub struct WebSocketEventBroadcaster {
 struct ClientState {
     tx: mpsc::Sender<String>,
 }
+
+// Global broadcaster instance for early server spawning
+static GLOBAL_BROADCASTER: OnceCell<WebSocketEventBroadcaster> = OnceCell::new();
 
 impl WebSocketEventBroadcaster {
     pub fn new() -> Self {
@@ -107,14 +111,18 @@ pub async fn spawn_websocket_server(
     info!("WebSocket event streaming server listening on ws://{}", addr);
 
     let handle = tokio::spawn(async move {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(b"WEBSOCKET DEBUG: Accept loop started\n"));
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(format!("WEBSOCKET DEBUG: TCP connection accepted from {}\n", peer_addr).as_bytes()));
                     debug!("New WebSocket connection from {}", peer_addr);
                     let broadcaster_clone = broadcaster.clone();
                     tokio::spawn(handle_websocket_client(stream, broadcaster_clone));
                 }
                 Err(e) => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(format!("WEBSOCKET DEBUG: Accept error: {}\n", e).as_bytes()));
                     error!("Failed to accept WebSocket connection: {}", e);
                 }
             }
@@ -126,10 +134,16 @@ pub async fn spawn_websocket_server(
 
 /// Handles a single WebSocket client connection.
 async fn handle_websocket_client(stream: TcpStream, broadcaster: WebSocketEventBroadcaster) {
+    use std::io::Write;
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(b"WEBSOCKET DEBUG: Client connection received, attempting upgrade\n"));
     // Upgrade the TCP connection to WebSocket
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
+        Ok(ws) => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(b"WEBSOCKET DEBUG: WebSocket upgrade successful\n"));
+            ws
+        }
         Err(e) => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(format!("WEBSOCKET DEBUG: WebSocket upgrade failed: {}\n", e).as_bytes()));
             error!("WebSocket upgrade failed: {}", e);
             return;
         }
@@ -237,6 +251,40 @@ pub async fn spawn_websocket_infrastructure(
     let _listener_handle = spawn_websocket_event_listener(thread, broadcaster);
 
     info!("WebSocket event streaming infrastructure started on port {}", port);
+
+    Ok(())
+}
+
+/// Spawn WebSocket server early (before thread is ready).
+/// This starts the network listener but doesn't attach event stream yet.
+/// The broadcaster is stored globally so the event listener can connect later.
+pub async fn spawn_websocket_server_only(
+    port: u16,
+) -> anyhow::Result<JoinHandle<()>> {
+    let broadcaster = WebSocketEventBroadcaster::new();
+
+    // Store broadcaster globally so listener can connect later
+    if GLOBAL_BROADCASTER.set(broadcaster.clone()).is_err() {
+        anyhow::bail!("WebSocket broadcaster already initialized");
+    }
+
+    let server_handle = spawn_websocket_server(port, broadcaster).await?;
+    info!("WebSocket server listening on ws://127.0.0.1:{}", port);
+
+    Ok(server_handle)
+}
+
+/// Connect event listener to existing WebSocket server.
+/// This attaches the thread's event stream to broadcast to clients.
+/// Must be called after spawn_websocket_server_only.
+pub fn spawn_event_listener_only(
+    thread: Arc<CodexThread>,
+) -> anyhow::Result<()> {
+    let broadcaster = GLOBAL_BROADCASTER.get()
+        .ok_or_else(|| anyhow::anyhow!("WebSocket broadcaster not initialized - call spawn_websocket_server_only first"))?;
+
+    spawn_websocket_event_listener(thread, broadcaster.clone());
+    info!("WebSocket event listener connected to thread");
 
     Ok(())
 }

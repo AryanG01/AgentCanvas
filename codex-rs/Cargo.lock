@@ -2507,6 +2507,7 @@ dependencies = [
  "itertools 0.14.0",
  "lazy_static",
  "libc",
+ "once_cell",
  "pathdiff",
  "pretty_assertions",
  "pulldown-cmark",

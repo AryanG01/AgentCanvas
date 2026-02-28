@@ -34,6 +34,8 @@ interface GraphState {
 const REPLAY_API = import.meta.env.VITE_REPLAY_API ?? '/api/sessions'
 const BASE_WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:5173/ws'
 const BASE_JSONL_WS_URL = import.meta.env.VITE_JSONL_WS_URL ?? 'ws://localhost:3737'
+console.log('[graphStore] VITE_JSONL_WS_URL:', import.meta.env.VITE_JSONL_WS_URL)
+console.log('[graphStore] BASE_JSONL_WS_URL:', BASE_JSONL_WS_URL)
 
 const initialState = {
   events: [] as AppEvent[],

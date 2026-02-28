@@ -1567,25 +1567,41 @@ impl App {
             }
         };
 
-        // Spawn WebSocket event streaming for active thread
-        if let Some(thread_id) = chat_widget.thread_id() {
-            if let Ok(thread) = thread_manager.get_thread(thread_id).await {
-                match websocket_broadcaster::spawn_websocket_infrastructure(
-                    websocket_port,
-                    thread,
-                )
-                .await
-                {
-                    Ok(_) => tracing::info!(
-                        "WebSocket event streaming on ws://127.0.0.1:{}",
-                        websocket_port
-                    ),
-                    Err(err) => tracing::warn!(
-                        "WebSocket server failed to start: {}. Continuing without streaming.",
-                        err
-                    ),
+        // Spawn WebSocket server early (before UI loads)
+        // It will start listening immediately, even if no thread events yet
+        let _websocket_handle = {
+            use std::io::Write;
+            // Debug logging to file since TUI obscures terminal output
+            let debug_msg = format!("WEBSOCKET DEBUG: About to spawn server on port {}\n", websocket_port);
+            let _ = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(debug_msg.as_bytes()));
+            tracing::info!("Starting WebSocket event streaming on ws://127.0.0.1:{}", websocket_port);
+
+            match crate::websocket_broadcaster::spawn_websocket_server_only(websocket_port).await {
+                Ok(handle) => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(b"WEBSOCKET DEBUG: Server spawned successfully\n"));
+                    tracing::info!("WebSocket server ready on ws://127.0.0.1:{}", websocket_port);
+                    Some(handle)
+                }
+                Err(err) => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/websocket_debug.log").and_then(|mut f| f.write_all(format!("WEBSOCKET DEBUG: ERROR: {}\n", err).as_bytes()));
+                    tracing::error!("Failed to start WebSocket server: {}. UI will not be able to connect.", err);
+                    None
                 }
             }
+        };
+
+        // Connect WebSocket event listener to active thread (if available)
+        if let Some(thread_id) = chat_widget.thread_id() {
+            if let Ok(thread) = thread_manager.get_thread(thread_id).await {
+                match crate::websocket_broadcaster::spawn_event_listener_only(thread) {
+                    Ok(_) => tracing::info!("WebSocket event listener connected to thread {}", thread_id),
+                    Err(err) => tracing::warn!("Failed to connect event listener: {}", err),
+                }
+            } else {
+                tracing::warn!("No active thread available for WebSocket event streaming");
+            }
+        } else {
+            tracing::warn!("No thread ID available for WebSocket event streaming");
         }
 
         // Spawn HTTP server and auto-open browser if UI is enabled
