@@ -54,6 +54,7 @@
             cargo-edit
             cargo-audit
             rust-analyzer
+            nodejs
           ];
 
           # Environment variables for build
