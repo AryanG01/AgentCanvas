@@ -1,18 +1,26 @@
 // ---------------------------------------------------------------------------
-// App-server v2 protocol events (subset we care about)
+// Internal normalized AppEvent union
+// These are our internal types — the WS hook maps real protocol JSON into these.
 // ---------------------------------------------------------------------------
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected'
 
+/** Emitted once per codex app-server session/thread. Creates the root node. */
+export interface ThreadStartedEvent {
+  type: 'ThreadStarted'
+  threadId: string
+  ts: number
+}
+
 /**
- * Emitted when a new user turn begins.
- * NOTE: userPrompt is NOT in the wire protocol's turn/started notification.
- * It arrives via a subsequent userMessage item and is patched in by the store.
+ * Emitted when a new user turn begins (from `turn/started` notification).
+ * NOTE: userPrompt starts as '(typing…)' — it is patched in when the
+ * `userMessage` item arrives via `item/completed`.
  */
 export interface TurnStartedEvent {
   type: 'TurnStarted'
   turnId: string
-  sessionId: string
+  sessionId: string   // threadId
   userPrompt: string
   ts: number
 }
@@ -40,6 +48,7 @@ export interface McpToolCallEvent {
   id: string
   turnId: string
   toolName: string
+  server?: string
   input: unknown
   output: unknown
   status: 'success' | 'error'
@@ -64,19 +73,29 @@ export interface PlanUpdateEvent {
   ts: number
 }
 
+/** Internal synthetic event — updates a turn node's label from the userMessage item */
+export interface UserPromptPatchEvent {
+  type: 'UserPromptPatch'
+  turnId: string
+  userPrompt: string
+  ts: number
+}
+
 export type AppEvent =
+  | ThreadStartedEvent
   | TurnStartedEvent
   | TurnCompleteEvent
   | CommandExecutionEvent
   | McpToolCallEvent
   | PatchApplyEvent
   | PlanUpdateEvent
+  | UserPromptPatchEvent
 
 // ---------------------------------------------------------------------------
 // Graph node types
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error'
+export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error'
 
 export interface GraphNodeData {
   kind: NodeKind
@@ -84,5 +103,10 @@ export interface GraphNodeData {
   status?: string
   turnId: string
   rawEvent: AppEvent
-  collapsed?: boolean // for TurnNode: are children hidden? (future use)
+  collapsed?: boolean
 }
+
+// ---------------------------------------------------------------------------
+// Edge kinds — used to drive visual styling
+// ---------------------------------------------------------------------------
+export type EdgeKind = 'flow' | 'detail'
