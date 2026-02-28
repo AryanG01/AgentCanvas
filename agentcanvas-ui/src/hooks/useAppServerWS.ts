@@ -4,6 +4,7 @@ import type { AppEvent } from '../lib/types'
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:5173/ws'
 const MAX_BACKOFF = 30_000
+const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 
 export function useAppServerWS() {
   const addEvent = useGraphStore(s => s.addEvent)
@@ -13,6 +14,9 @@ export function useAppServerWS() {
   const unmountedRef = useRef(false)
 
   useEffect(() => {
+    // Skip WebSocket entirely in mock mode — avoids reconnect loop noise
+    if (USE_MOCK) return
+
     unmountedRef.current = false
 
     function connect() {

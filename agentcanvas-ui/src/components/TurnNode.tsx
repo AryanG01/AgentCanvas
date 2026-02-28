@@ -2,28 +2,53 @@ import { memo } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import type { GraphNodeData } from '../lib/types'
 
-const statusColors: Record<string, string> = {
-  running: 'bg-yellow-400',
-  success: 'bg-green-400',
-  error: 'bg-red-400',
-  cancelled: 'bg-gray-400',
+const statusConfig: Record<string, { dot: string; ring: string; label: string }> = {
+  running:   { dot: 'bg-yellow-400 animate-pulse', ring: 'border-yellow-500/40',  label: 'In Progress' },
+  success:   { dot: 'bg-green-400',                ring: 'border-green-500/40',   label: 'Done' },
+  error:     { dot: 'bg-red-400',                  ring: 'border-red-500/40',     label: 'Failed' },
+  cancelled: { dot: 'bg-zinc-400',                 ring: 'border-zinc-500/40',    label: 'Cancelled' },
 }
 
 export const TurnNode = memo(({ data, selected }: NodeProps<GraphNodeData>) => {
+  const cfg = statusConfig[data.status ?? 'running']
   return (
     <div
       className={`
-        w-[220px] rounded-lg border-2 px-3 py-2 shadow-md bg-zinc-900 text-white
-        ${selected ? 'border-blue-400' : 'border-zinc-600'}
+        w-[240px] rounded-xl border-2 px-4 py-3 shadow-xl
+        bg-gradient-to-b from-zinc-800 to-zinc-900 text-white
+        transition-all duration-150
+        ${selected ? 'border-indigo-400 shadow-indigo-500/20 shadow-2xl' : `${cfg.ring} border`}
       `}
     >
-      <Handle type="target" position={Position.Top} className="!bg-zinc-500" />
-      <div className="flex items-center gap-2">
-        <span className={`h-2.5 w-2.5 rounded-full flex-shrink-0 ${statusColors[data.status ?? 'running']}`} />
-        <span className="text-xs font-semibold text-zinc-400 flex-shrink-0">Turn</span>
+      <Handle
+        type="target"
+        position={Position.Top}
+        className="!bg-zinc-600 !border-zinc-500 !w-2 !h-2"
+      />
+
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">
+            Turn
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className={`h-2 w-2 rounded-full ${cfg.dot}`} />
+          <span className="text-[10px] text-zinc-400">{cfg.label}</span>
+        </div>
       </div>
-      <p className="mt-1 text-sm leading-tight line-clamp-2 text-zinc-100">{data.label}</p>
-      <Handle type="source" position={Position.Bottom} className="!bg-zinc-500" />
+
+      {/* Prompt text */}
+      <p className="text-sm leading-snug text-zinc-100 line-clamp-3 font-medium">
+        {data.label || <span className="text-zinc-500 italic">loading…</span>}
+      </p>
+
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        className="!bg-zinc-600 !border-zinc-500 !w-2 !h-2"
+      />
     </div>
   )
 })

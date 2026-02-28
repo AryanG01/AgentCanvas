@@ -13,12 +13,14 @@ function AppInner() {
   const addEvent = useGraphStore(s => s.addEvent)
   useAppServerWS()
 
-  // Load mock events with staggered delay to simulate streaming
+  // Load mock events with staggered delay to simulate streaming.
+  // Return a cleanup that cancels pending timers — prevents StrictMode double-fire.
   useEffect(() => {
     if (!USE_MOCK) return
-    MOCK_EVENTS.forEach((event, i) => {
+    const timers = MOCK_EVENTS.map((event, i) =>
       setTimeout(() => addEvent(event), i * 300)
-    })
+    )
+    return () => timers.forEach(clearTimeout)
   }, [])
 
   return (
