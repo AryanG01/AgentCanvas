@@ -38,3 +38,10 @@ pub struct SessionSummaryNodeMatch {
     pub matched_command: Option<String>,
     pub matched_error_text: Option<String>,
 }
+
+#[derive(Clone, Debug)]
+pub struct SessionSummarySemanticNodeMatch {
+    pub node_match: SessionSummaryNodeMatch,
+    pub embedding_model: String,
+    pub semantic_score: f64,
+}

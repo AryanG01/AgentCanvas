@@ -2,12 +2,21 @@ use super::*;
 use serde_json::Map;
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+const SUMMARY_SEMANTIC_EMBEDDING_MODEL: &str = "jina-embeddings-v5-text-nano";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct IndexedCommand {
     command: String,
     exit_code: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct IndexedSemanticTerm {
+    term_hash: i64,
+    weight_milli: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +29,7 @@ struct IndexedSummaryNode {
     file_paths: Vec<String>,
     commands: Vec<IndexedCommand>,
     errors: Vec<String>,
+    semantic_terms: Vec<IndexedSemanticTerm>,
 }
 
 impl StateRuntime {
@@ -155,6 +165,24 @@ INSERT INTO summary_node_errors (
                 .bind(summary_id.as_str())
                 .bind(node.node_id.as_str())
                 .bind(error_text.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            for term in &node.semantic_terms {
+                sqlx::query(
+                    r#"
+INSERT INTO summary_node_semantic_terms (
+    summary_id,
+    node_id,
+    term_hash,
+    weight
+) VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(summary_id.as_str())
+                .bind(node.node_id.as_str())
+                .bind(term.term_hash)
+                .bind((term.weight_milli as f64) / 1000.0)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -471,6 +499,77 @@ LIMIT ?
         .await?;
         rows.iter().map(summary_node_match_from_row).collect()
     }
+
+    pub async fn search_summary_nodes_by_semantic_text(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SessionSummarySemanticNodeMatch>> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query_terms = semantic_terms_from_text(query);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            r#"
+WITH query_terms(term_hash, query_weight) AS (
+"#,
+        );
+        sql.push_values(query_terms.iter(), |mut row, term| {
+            row.push_bind(term.term_hash)
+                .push_bind((term.weight_milli as f64) / 1000.0);
+        });
+        sql.push(
+            r#"
+),
+scored_nodes AS (
+    SELECT
+        terms.summary_id,
+        terms.node_id,
+        SUM(terms.weight * query_terms.query_weight) AS semantic_score
+    FROM summary_node_semantic_terms AS terms
+    INNER JOIN query_terms
+        ON query_terms.term_hash = terms.term_hash
+    GROUP BY terms.summary_id, terms.node_id
+    ORDER BY semantic_score DESC
+    LIMIT
+"#,
+        )
+        .push_bind(limit)
+        .push(
+            r#"
+)
+SELECT
+    artifacts.summary_id,
+    artifacts.thread_id,
+    artifacts.session_id,
+    artifacts.summary_path,
+    nodes.node_id,
+    nodes.parent_node_id,
+    nodes.node_type,
+    nodes.title,
+    nodes.node_json,
+    NULL AS matched_file_path,
+    NULL AS matched_command,
+    NULL AS matched_error_text,
+    scored_nodes.semantic_score
+FROM scored_nodes
+INNER JOIN summary_nodes AS nodes
+    ON nodes.summary_id = scored_nodes.summary_id
+    AND nodes.node_id = scored_nodes.node_id
+INNER JOIN summary_artifacts AS artifacts
+    ON artifacts.summary_id = scored_nodes.summary_id
+ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
+"#,
+        );
+        let rows = sql.build().fetch_all(self.pool.as_ref()).await?;
+        rows.iter()
+            .map(summary_semantic_node_match_from_row)
+            .collect()
+    }
 }
 
 fn summary_path_for_thread_and_session(
@@ -550,6 +649,16 @@ fn summary_node_match_from_row(row: &SqliteRow) -> anyhow::Result<SessionSummary
     })
 }
 
+fn summary_semantic_node_match_from_row(
+    row: &SqliteRow,
+) -> anyhow::Result<SessionSummarySemanticNodeMatch> {
+    Ok(SessionSummarySemanticNodeMatch {
+        node_match: summary_node_match_from_row(row)?,
+        embedding_model: SUMMARY_SEMANTIC_EMBEDDING_MODEL.to_string(),
+        semantic_score: row.try_get("semantic_score")?,
+    })
+}
+
 fn index_summary_nodes(summary: &Value) -> anyhow::Result<Vec<IndexedSummaryNode>> {
     let mut indexed_nodes = Vec::new();
     collect_indexed_nodes(summary, None, "root", &mut indexed_nodes)?;
@@ -581,18 +690,29 @@ fn collect_indexed_nodes(
                 let mut commands = BTreeSet::new();
                 let mut errors = BTreeSet::new();
                 collect_node_evidence(value, None, &mut file_paths, &mut commands, &mut errors);
+                let node_type = string_value(object, &["node_type", "nodeType", "type"])
+                    .unwrap_or_else(|| "unknown".to_string());
+                let node_title = string_value(object, &["title", "label", "summary"]);
+                let semantic_terms = semantic_terms_for_node(
+                    value,
+                    node_type.as_str(),
+                    node_title.as_deref(),
+                    &file_paths,
+                    &commands,
+                    &errors,
+                );
                 let node_json = serde_json::to_string(value)?;
                 indexed_nodes.push(IndexedSummaryNode {
                     node_id: node_id.clone(),
                     parent_node_id: string_value(object, &["parent_id", "parentId"])
                         .or_else(|| inherited_parent_id.map(ToOwned::to_owned)),
-                    node_type: string_value(object, &["node_type", "nodeType", "type"])
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    title: string_value(object, &["title", "label", "summary"]),
+                    node_type,
+                    title: node_title,
                     node_json,
                     file_paths: file_paths.into_iter().collect(),
                     commands: commands.into_iter().collect(),
                     errors: errors.into_iter().collect(),
+                    semantic_terms,
                 });
                 for (idx, child) in summary_child_nodes(object).iter().enumerate() {
                     collect_indexed_nodes(
@@ -734,6 +854,210 @@ fn string_value(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     None
 }
 
+fn semantic_terms_for_node(
+    node: &Value,
+    node_type: &str,
+    title: Option<&str>,
+    file_paths: &BTreeSet<String>,
+    commands: &BTreeSet<IndexedCommand>,
+    errors: &BTreeSet<String>,
+) -> Vec<IndexedSemanticTerm> {
+    let mut text_fragments = Vec::new();
+    if !node_type.is_empty() {
+        text_fragments.push(node_type.to_string());
+    }
+    if let Some(title) = title
+        && !title.trim().is_empty()
+    {
+        text_fragments.push(title.to_string());
+    }
+    collect_semantic_text_fragments(node, None, &mut text_fragments);
+    for file_path in file_paths {
+        text_fragments.push(file_path.clone());
+    }
+    for command in commands {
+        text_fragments.push(command.command.clone());
+    }
+    for error in errors {
+        text_fragments.push(error.clone());
+    }
+    semantic_terms_from_text(text_fragments.join(" ").as_str())
+}
+
+fn collect_semantic_text_fragments(
+    value: &Value,
+    key_hint: Option<&str>,
+    text_fragments: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let key_lower = key.to_ascii_lowercase();
+                collect_semantic_text_fragments(child, Some(key_lower.as_str()), text_fragments);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_semantic_text_fragments(child, key_hint, text_fragments);
+            }
+        }
+        Value::String(text) => {
+            let Some(key_hint) = key_hint else {
+                return;
+            };
+            if is_semantic_text_key(key_hint) && !text.trim().is_empty() {
+                text_fragments.push(text.clone());
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn is_semantic_text_key(key: &str) -> bool {
+    matches!(
+        key,
+        "title"
+            | "label"
+            | "summary"
+            | "description"
+            | "message"
+            | "status"
+            | "reason"
+            | "node_type"
+            | "nodetype"
+            | "type"
+            | "command"
+            | "commands"
+            | "cmd"
+            | "error"
+            | "errors"
+            | "error_text"
+            | "last_error"
+            | "file"
+            | "files"
+            | "file_path"
+            | "file_paths"
+            | "path"
+            | "paths"
+    )
+}
+
+fn semantic_terms_from_text(text: &str) -> Vec<IndexedSemanticTerm> {
+    let tokens = semantic_tokens(text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut weights_by_hash = BTreeMap::<i64, f64>::new();
+    for token in &tokens {
+        add_semantic_weight(
+            &mut weights_by_hash,
+            semantic_term_hash(format!("w:{token}").as_str()),
+            1.0,
+        );
+        let token_bytes = token.as_bytes();
+        if token_bytes.len() >= 5 {
+            for window in token_bytes.windows(3) {
+                let trigram = String::from_utf8_lossy(window);
+                add_semantic_weight(
+                    &mut weights_by_hash,
+                    semantic_term_hash(format!("g:{trigram}").as_str()),
+                    0.2,
+                );
+            }
+        }
+    }
+    for token_pair in tokens.windows(2) {
+        let bigram = format!("{} {}", token_pair[0], token_pair[1]);
+        add_semantic_weight(
+            &mut weights_by_hash,
+            semantic_term_hash(format!("b:{bigram}").as_str()),
+            0.75,
+        );
+    }
+
+    let mut weighted_features: Vec<(i64, f64)> = weights_by_hash.into_iter().collect();
+    weighted_features.sort_by(|(left_hash, left_weight), (right_hash, right_weight)| {
+        right_weight
+            .total_cmp(left_weight)
+            .then_with(|| left_hash.cmp(right_hash))
+    });
+    const MAX_FEATURES: usize = 96;
+    if weighted_features.len() > MAX_FEATURES {
+        weighted_features.truncate(MAX_FEATURES);
+    }
+
+    let norm = weighted_features
+        .iter()
+        .map(|(_, weight)| weight * weight)
+        .sum::<f64>()
+        .sqrt();
+    if norm <= f64::EPSILON {
+        return Vec::new();
+    }
+
+    let mut terms = Vec::with_capacity(weighted_features.len());
+    for (term_hash, raw_weight) in weighted_features {
+        let normalized_weight = raw_weight / norm;
+        let weight_milli = (normalized_weight * 1000.0).round() as i64;
+        if weight_milli == 0 {
+            continue;
+        }
+        terms.push(IndexedSemanticTerm {
+            term_hash,
+            weight_milli,
+        });
+    }
+    terms.sort_by(|left, right| left.term_hash.cmp(&right.term_hash));
+    terms
+}
+
+fn add_semantic_weight(weights_by_hash: &mut BTreeMap<i64, f64>, term_hash: i64, delta: f64) {
+    let entry = weights_by_hash.entry(term_hash).or_insert(0.0);
+    *entry += delta;
+}
+
+fn semantic_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+            continue;
+        }
+        if let Some(token) = normalize_semantic_token(current.as_str()) {
+            tokens.push(token);
+        }
+        current.clear();
+    }
+    if let Some(token) = normalize_semantic_token(current.as_str()) {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn normalize_semantic_token(token: &str) -> Option<String> {
+    if token.len() < 2 {
+        return None;
+    }
+    if token.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn semantic_term_hash(text: &str) -> i64 {
+    const FNV_OFFSET_BASIS: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    i64::from(hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::unique_temp_dir;
@@ -765,6 +1089,34 @@ mod tests {
                             }
                         }
                     ]
+                }
+            ]
+        })
+    }
+
+    fn sample_summary_for_semantic_search() -> Value {
+        json!({
+            "schema_version": "v1",
+            "nodes": [
+                {
+                    "node_id": "test-node",
+                    "node_type": "execution",
+                    "title": "Run state tests",
+                    "summary": "Executed cargo test for codex-state and validated summary indexing.",
+                    "evidence": {
+                        "commands": [{"command": "cargo test -p codex-state"}],
+                        "errors": []
+                    }
+                },
+                {
+                    "node_id": "deploy-node",
+                    "node_type": "execution",
+                    "title": "Publish release",
+                    "summary": "Pushed release artifacts to production.",
+                    "evidence": {
+                        "commands": [{"command": "deploy --env prod"}],
+                        "errors": []
+                    }
                 }
             ]
         })
@@ -943,6 +1295,53 @@ mod tests {
             .expect("list nodes");
         let node_ids: Vec<String> = nodes.into_iter().map(|node| node.node_id).collect();
         assert_eq!(node_ids, vec!["n1".to_string(), "n3".to_string()]);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn summary_semantic_search_returns_relevant_nodes() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+        runtime
+            .upsert_session_summary(&SessionSummaryPersistParams {
+                summary_id: None,
+                thread_id: "thread-semantic".to_string(),
+                session_id: "session-semantic".to_string(),
+                schema_version: "v1".to_string(),
+                root_node_id: None,
+                summary: sample_summary_for_semantic_search(),
+            })
+            .await
+            .expect("upsert summary");
+
+        let test_matches = runtime
+            .search_summary_nodes_by_semantic_text("run codex state tests", 10)
+            .await
+            .expect("semantic search should succeed");
+        assert!(!test_matches.is_empty());
+        assert_eq!(test_matches[0].node_match.node_id, "test-node");
+        assert_eq!(
+            test_matches[0].embedding_model,
+            "jina-embeddings-v5-text-nano"
+        );
+        assert!(test_matches[0].semantic_score > 0.0);
+
+        let deploy_matches = runtime
+            .search_summary_nodes_by_semantic_text("deploy production release", 10)
+            .await
+            .expect("semantic search should succeed");
+        assert!(!deploy_matches.is_empty());
+        assert_eq!(deploy_matches[0].node_match.node_id, "deploy-node");
+        assert!(deploy_matches[0].semantic_score > 0.0);
+
+        let no_matches = runtime
+            .search_summary_nodes_by_semantic_text("zxqwy impossible token", 10)
+            .await
+            .expect("semantic search should succeed");
+        assert!(no_matches.is_empty());
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

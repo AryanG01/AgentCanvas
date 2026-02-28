@@ -15,6 +15,7 @@ use crate::STATE_DB_VERSION;
 use crate::SessionSummaryArtifact;
 use crate::SessionSummaryNodeMatch;
 use crate::SessionSummaryPersistParams;
+use crate::SessionSummarySemanticNodeMatch;
 use crate::SortKey;
 use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;

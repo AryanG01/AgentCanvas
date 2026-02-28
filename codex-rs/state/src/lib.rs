@@ -38,6 +38,7 @@ pub use model::ExtractionOutcome;
 pub use model::SessionSummaryArtifact;
 pub use model::SessionSummaryNodeMatch;
 pub use model::SessionSummaryPersistParams;
+pub use model::SessionSummarySemanticNodeMatch;
 pub use model::SortKey;
 pub use model::Stage1JobClaim;
 pub use model::Stage1JobClaimOutcome;
