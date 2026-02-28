@@ -35,6 +35,7 @@ codex-backend-client = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-cloud-requirements = { workspace = true }
 codex-core = { workspace = true }
+codex-exec = { workspace = true }
 codex-feedback = { workspace = true }
 codex-file-search = { workspace = true }
 codex-login = { workspace = true }
@@ -57,6 +58,7 @@ derive_more = { workspace = true, features = ["is_variant"] }
 diffy = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
+futures = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
@@ -85,13 +87,16 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
+    "sync",
     "test-util",
     "time",
 ] }
 tokio-stream = { workspace = true, features = ["sync"] }
+tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tracing-appender = { workspace = true }
@@ -106,6 +111,8 @@ uuid = { workspace = true }
 
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["fs"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = { version = "0.15", optional = true }
