@@ -1,6 +1,6 @@
 //! Translates `NormalizedEvent` streams into `AppEvent` types for the UI.
 
-use crate::schema::{EventPayload, ItemDetails, NormalizedEvent};
+use crate::schema::{EventPayload, ItemDetails, McpStatus, NormalizedEvent, PatchStatus};
 
 use super::app_event::AppEvent;
 
@@ -20,10 +20,18 @@ pub fn translate(event: &NormalizedEvent) -> Vec<AppEvent> {
     let ts = event.timestamp;
 
     match &event.payload {
+        EventPayload::ThreadStarted(_) => {
+            vec![AppEvent::ThreadStarted {
+                thread_id: event.thread_id.clone(),
+                ts,
+            }]
+        }
+
         EventPayload::TurnStarted(_) => {
             vec![AppEvent::TurnStarted {
                 turn_id,
                 session_id: event.thread_id.clone(),
+                user_prompt: String::new(),
                 ts,
             }]
         }
@@ -31,7 +39,7 @@ pub fn translate(event: &NormalizedEvent) -> Vec<AppEvent> {
         EventPayload::TurnCompleted(_) => {
             vec![AppEvent::TurnComplete {
                 turn_id,
-                status: "completed".to_string(),
+                status: "success".to_string(),
                 ts,
             }]
         }
@@ -39,7 +47,7 @@ pub fn translate(event: &NormalizedEvent) -> Vec<AppEvent> {
         EventPayload::TurnFailed(_) => {
             vec![AppEvent::TurnComplete {
                 turn_id,
-                status: "failed".to_string(),
+                status: "error".to_string(),
                 ts,
             }]
         }
@@ -63,20 +71,26 @@ pub fn translate(event: &NormalizedEvent) -> Vec<AppEvent> {
                         .clone()
                         .unwrap_or_else(|| serde_json::Value::Array(r.content.clone()))
                 });
-                let status = format!("{:?}", details.status).to_lowercase();
+                let status = match details.status {
+                    McpStatus::Completed => "success",
+                    _ => "error",
+                };
                 vec![AppEvent::McpToolCall {
                     id: item_id,
                     turn_id,
                     tool_name: format!("{}/{}", details.server, details.tool),
                     input: details.arguments.clone(),
                     output,
-                    status,
+                    status: status.to_string(),
                     ts,
                 }]
             }
 
             ItemDetails::FileChange(details) => {
-                let status = format!("{:?}", details.status).to_lowercase();
+                let status = match details.status {
+                    PatchStatus::Completed => "success",
+                    _ => "error",
+                };
                 details
                     .changes
                     .iter()
@@ -92,7 +106,7 @@ pub fn translate(event: &NormalizedEvent) -> Vec<AppEvent> {
                             turn_id: turn_id.clone(),
                             filename: change.path.clone(),
                             diff: format!("{:?}", change.kind).to_lowercase(),
-                            status: status.clone(),
+                            status: status.to_string(),
                             ts,
                         }
                     })
@@ -125,9 +139,8 @@ pub fn translate(event: &NormalizedEvent) -> Vec<AppEvent> {
             _ => vec![],
         },
 
-        // Thread-level and streaming events don't produce UI AppEvents.
-        EventPayload::ThreadStarted(_)
-        | EventPayload::ThreadClosed
+        // Streaming and close events don't produce UI AppEvents.
+        EventPayload::ThreadClosed
         | EventPayload::ItemStarted(_)
         | EventPayload::ItemUpdated(_)
         | EventPayload::ItemDelta(_)

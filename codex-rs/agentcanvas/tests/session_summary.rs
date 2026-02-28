@@ -192,7 +192,29 @@ fn bridge_translates_normalized_events_to_app_events() {
     let thread_id = "thread-bridge-test";
     let turn_id = "turn-1";
 
-    // TurnStarted -> AppEvent::TurnStarted
+    // ThreadStarted -> AppEvent::ThreadStarted
+    let thread_started = NormalizedEvent::new(
+        thread_id.to_string(),
+        None,
+        None,
+        99,
+        EventSource::ExecJson,
+        "thread.started".to_string(),
+        EventPayload::ThreadStarted(codex_agentcanvas::ThreadStartedPayload {}),
+    );
+    let app_events = translate_to_app_event(&thread_started);
+    assert_eq!(app_events.len(), 1);
+    match &app_events[0] {
+        AppEvent::ThreadStarted {
+            thread_id: tid, ts, ..
+        } => {
+            assert_eq!(tid, thread_id);
+            assert_eq!(*ts, 99);
+        }
+        other => panic!("expected ThreadStarted, got {other:?}"),
+    }
+
+    // TurnStarted -> AppEvent::TurnStarted (with empty userPrompt)
     let turn_started = NormalizedEvent::new(
         thread_id.to_string(),
         Some(turn_id.to_string()),
@@ -208,10 +230,12 @@ fn bridge_translates_normalized_events_to_app_events() {
         AppEvent::TurnStarted {
             turn_id: tid,
             session_id,
+            user_prompt,
             ts,
         } => {
             assert_eq!(tid, turn_id);
             assert_eq!(session_id, thread_id);
+            assert!(user_prompt.is_empty(), "userPrompt should start empty");
             assert_eq!(*ts, 100);
         }
         other => panic!("expected TurnStarted, got {other:?}"),
@@ -248,7 +272,7 @@ fn bridge_translates_normalized_events_to_app_events() {
         other => panic!("expected CommandExecution, got {other:?}"),
     }
 
-    // McpToolCall -> AppEvent::McpToolCall
+    // McpToolCall -> AppEvent::McpToolCall with "success" status
     let mcp_event = normalized_item_completed_event(
         thread_id,
         turn_id,
@@ -274,12 +298,12 @@ fn bridge_translates_normalized_events_to_app_events() {
         } => {
             assert_eq!(id, "tool-1");
             assert_eq!(tool_name, "filesystem/read_file");
-            assert_eq!(status, "completed");
+            assert_eq!(status, "success");
         }
         other => panic!("expected McpToolCall, got {other:?}"),
     }
 
-    // FileChange with multiple files -> multiple PatchApply events
+    // FileChange with multiple files -> multiple PatchApply events with "success" status
     let file_event = normalized_item_completed_event(
         thread_id,
         turn_id,
@@ -303,21 +327,31 @@ fn bridge_translates_normalized_events_to_app_events() {
     assert_eq!(app_events.len(), 2, "multi-file change should fan out");
     match &app_events[0] {
         AppEvent::PatchApply {
-            id, filename, diff, ..
+            id,
+            filename,
+            diff,
+            status,
+            ..
         } => {
             assert_eq!(id, "patch-1:0");
             assert_eq!(filename, "src/a.rs");
             assert_eq!(diff, "update");
+            assert_eq!(status, "success");
         }
         other => panic!("expected PatchApply, got {other:?}"),
     }
     match &app_events[1] {
         AppEvent::PatchApply {
-            id, filename, diff, ..
+            id,
+            filename,
+            diff,
+            status,
+            ..
         } => {
             assert_eq!(id, "patch-1:1");
             assert_eq!(filename, "src/b.rs");
             assert_eq!(diff, "add");
+            assert_eq!(status, "success");
         }
         other => panic!("expected PatchApply, got {other:?}"),
     }
@@ -352,7 +386,7 @@ fn bridge_translates_normalized_events_to_app_events() {
         other => panic!("expected PlanUpdate, got {other:?}"),
     }
 
-    // TurnCompleted -> AppEvent::TurnComplete
+    // TurnCompleted -> AppEvent::TurnComplete with "success" status
     let turn_completed = NormalizedEvent::new(
         thread_id.to_string(),
         Some(turn_id.to_string()),
@@ -372,12 +406,12 @@ fn bridge_translates_normalized_events_to_app_events() {
     assert_eq!(app_events.len(), 1);
     match &app_events[0] {
         AppEvent::TurnComplete { status, .. } => {
-            assert_eq!(status, "completed");
+            assert_eq!(status, "success");
         }
         other => panic!("expected TurnComplete, got {other:?}"),
     }
 
-    // TurnFailed -> AppEvent::TurnComplete with "failed" status
+    // TurnFailed -> AppEvent::TurnComplete with "error" status
     let turn_failed = NormalizedEvent::new(
         thread_id.to_string(),
         Some(turn_id.to_string()),
@@ -393,26 +427,63 @@ fn bridge_translates_normalized_events_to_app_events() {
     assert_eq!(app_events.len(), 1);
     match &app_events[0] {
         AppEvent::TurnComplete { status, .. } => {
-            assert_eq!(status, "failed");
+            assert_eq!(status, "error");
         }
         other => panic!("expected TurnComplete, got {other:?}"),
     }
+}
 
-    // ThreadStarted -> no AppEvent
-    let thread_started = NormalizedEvent::new(
-        thread_id.to_string(),
-        None,
-        None,
-        99,
-        EventSource::ExecJson,
-        "thread.started".to_string(),
-        EventPayload::ThreadStarted(codex_agentcanvas::ThreadStartedPayload {}),
-    );
-    let app_events = translate_to_app_event(&thread_started);
-    assert!(
-        app_events.is_empty(),
-        "thread-level events should not produce AppEvents"
-    );
+/// Verify the bridge AppEvent JSON serialization matches the TypeScript types
+/// expected by Engineer 4's UI (agentcanvas-ui/src/lib/types.ts).
+#[test]
+fn bridge_app_event_json_matches_ui_types() {
+    // TurnStarted should serialize with PascalCase type tag and camelCase fields
+    let event = AppEvent::TurnStarted {
+        turn_id: "t1".to_string(),
+        session_id: "s1".to_string(),
+        user_prompt: "hello".to_string(),
+        ts: 1000,
+    };
+    let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "TurnStarted");
+    assert_eq!(json["turnId"], "t1");
+    assert_eq!(json["sessionId"], "s1");
+    assert_eq!(json["userPrompt"], "hello");
+    assert_eq!(json["ts"], 1000);
+
+    // ThreadStarted should serialize correctly
+    let event = AppEvent::ThreadStarted {
+        thread_id: "s1".to_string(),
+        ts: 900,
+    };
+    let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "ThreadStarted");
+    assert_eq!(json["threadId"], "s1");
+
+    // TurnComplete should use "success"/"error" status values
+    let event = AppEvent::TurnComplete {
+        turn_id: "t1".to_string(),
+        status: "success".to_string(),
+        ts: 2000,
+    };
+    let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "TurnComplete");
+    assert_eq!(json["status"], "success");
+
+    // CommandExecution field names should match UI
+    let event = AppEvent::CommandExecution {
+        id: "e1".to_string(),
+        turn_id: "t1".to_string(),
+        cmd: "ls".to_string(),
+        exit_code: Some(0),
+        stdout: "foo".to_string(),
+        stderr: "".to_string(),
+        ts: 1001,
+    };
+    let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "CommandExecution");
+    assert_eq!(json["exitCode"], 0);
+    assert_eq!(json["turnId"], "t1");
 }
 
 fn normalized_item_completed_event(

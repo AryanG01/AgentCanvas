@@ -1,8 +1,9 @@
 //! AppEvent types for Engineer 4's UI WebSocket protocol.
 //!
-//! These 6 event types are the contract between the backend event stream
-//! and the frontend React/TypeScript UI. Field names use camelCase to
-//! match the TypeScript interface.
+//! These event types are the contract between the backend event stream
+//! and the frontend React/TypeScript UI. Field names use camelCase via
+//! explicit `#[serde(rename)]` to match the TypeScript interfaces in
+//! `agentcanvas-ui/src/lib/types.ts`.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -10,17 +11,29 @@ use ts_rs::TS;
 /// UI-facing event types sent over WebSocket to the frontend.
 ///
 /// Each variant maps to a specific UI component update. The enum is
-/// adjacently tagged so the JSON shape is `{ "type": "TurnStarted", ... }`.
+/// internally tagged so the JSON shape is `{ "type": "TurnStarted", ... }`.
+///
+/// Variant names are PascalCase to match the TypeScript `AppEvent.type`
+/// discriminant values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type")]
 #[ts(export)]
 pub enum AppEvent {
+    /// Emitted once per session/thread. Creates the root graph node.
+    ThreadStarted {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        ts: i64,
+    },
+
     /// A new turn has begun.
     TurnStarted {
         #[serde(rename = "turnId")]
         turn_id: String,
         #[serde(rename = "sessionId")]
         session_id: String,
+        #[serde(rename = "userPrompt")]
+        user_prompt: String,
         ts: i64,
     },
 
@@ -28,6 +41,7 @@ pub enum AppEvent {
     TurnComplete {
         #[serde(rename = "turnId")]
         turn_id: String,
+        /// One of: "success", "error", "cancelled"
         status: String,
         ts: i64,
     },
@@ -54,6 +68,7 @@ pub enum AppEvent {
         tool_name: String,
         input: serde_json::Value,
         output: Option<serde_json::Value>,
+        /// One of: "success", "error"
         status: String,
         ts: i64,
     },
@@ -65,6 +80,7 @@ pub enum AppEvent {
         turn_id: String,
         filename: String,
         diff: String,
+        /// One of: "success", "error"
         status: String,
         ts: i64,
     },
