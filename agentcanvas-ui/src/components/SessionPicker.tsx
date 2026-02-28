@@ -9,10 +9,36 @@ export function SessionPicker() {
   const [open, setOpen] = useState(false)
 
   useEffect(() => {
-    fetchSessions()
-  }, [])
+    let cancelled = false
+    const refresh = async () => {
+      if (cancelled) return
+      await fetchSessions()
+    }
+    void refresh()
+    const id = setInterval(() => {
+      void refresh()
+    }, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [fetchSessions])
 
-  if (sessions.length === 0) return null
+  if (sessions.length === 0) {
+    return (
+      <div className="absolute top-4 left-4 z-20">
+        <button
+          onClick={() => { void fetchSessions() }}
+          className="flex items-center gap-2 bg-zinc-900/95 backdrop-blur-sm border border-zinc-700 rounded-xl px-3 py-2 shadow-2xl shadow-black/50 hover:border-indigo-500 transition-colors"
+        >
+          <svg className="w-4 h-4 text-indigo-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          <span className="text-sm text-zinc-100 font-medium">No sessions found</span>
+        </button>
+      </div>
+    )
+  }
 
   const selected = sessions.find(s => s.file === selectedSessionFile)
 

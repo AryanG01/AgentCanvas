@@ -36,49 +36,120 @@ function findAllRollouts(dir) {
   return results;
 }
 
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function formatLocalDateTime(tsValue) {
+  const ts = new Date(tsValue);
+  if (Number.isNaN(ts.getTime())) {
+    return { date: "1970-01-01", time: "00:00" };
+  }
+  return {
+    date: `${ts.getFullYear()}-${pad2(ts.getMonth() + 1)}-${pad2(ts.getDate())}`,
+    time: `${pad2(ts.getHours())}:${pad2(ts.getMinutes())}`,
+  };
+}
+
+function extractMessageText(content) {
+  if (!Array.isArray(content)) return "";
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (typeof part.text === "string" && part.text.trim()) return part.text;
+  }
+  return "";
+}
+
+function isSetupMessage(text) {
+  const trimmed = text.trim();
+  return (
+    trimmed.startsWith("<user_instructions>") ||
+    trimmed.startsWith("<environment_context>") ||
+    trimmed.startsWith("<turn_aborted>") ||
+    trimmed.startsWith("# AGENTS.md instructions") ||
+    trimmed.startsWith("<permissions instructions>")
+  );
+}
+
+function extractCwdFromText(text) {
+  const m = text.match(/<cwd>([^<]+)<\/cwd>/);
+  return m?.[1]?.trim() || "";
+}
+
+function parseArgumentsObject(args) {
+  if (typeof args === "object" && args !== null) return args;
+  if (typeof args !== "string") return null;
+  try {
+    return JSON.parse(args);
+  } catch {
+    return null;
+  }
+}
+
 function readSessionInfo(filePath) {
   try {
     const content = readFileSync(filePath, "utf-8");
     const lines = content.split("\n").filter((l) => l.trim());
+    const parsed = [];
+    for (const line of lines) {
+      try {
+        parsed.push(JSON.parse(line));
+      } catch {
+        // skip malformed lines
+      }
+    }
+    if (parsed.length === 0) return null;
 
     let meta = null;
     let taskStartedCount = 0;
     let turnContextCount = 0;
 
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        if (obj.type === "session_meta" && !meta) {
-          meta = obj.payload;
-        }
-        if (obj.type === "event_msg" && obj.payload?.type === "task_started") {
-          taskStartedCount++;
-        }
-        if (obj.type === "turn_context") {
-          turnContextCount++;
-        }
-      } catch {
-        // skip malformed lines
+    for (const obj of parsed) {
+      if (obj.type === "session_meta" && !meta) meta = obj.payload;
+      if (obj.type === "event_msg" && obj.payload?.type === "task_started") taskStartedCount++;
+      if (obj.type === "turn_context") turnContextCount++;
+    }
+
+    if (meta) {
+      const turnCount = taskStartedCount > 0 ? taskStartedCount : turnContextCount;
+      const { date, time } = formatLocalDateTime(meta.timestamp);
+      return {
+        date,
+        time,
+        turnCount,
+        source: meta.source || "unknown",
+        cwd: meta.cwd || "",
+        filePath,
+        id: meta.id,
+      };
+    }
+
+    const header = parsed[0];
+    if (!header?.id || !header?.timestamp) return null;
+
+    let turnCount = 0;
+    let cwd = "";
+    for (const obj of parsed) {
+      if (obj.type === "message" && obj.role === "user") {
+        const text = extractMessageText(obj.content);
+        if (text && !isSetupMessage(text)) turnCount++;
+        if (!cwd && text) cwd = extractCwdFromText(text);
+      }
+      if (!cwd && obj.type === "function_call") {
+        const args = parseArgumentsObject(obj.arguments);
+        if (typeof args?.workdir === "string") cwd = args.workdir;
       }
     }
 
-    // Use task_started count if available, otherwise fall back to turn_context
-    const turnCount = taskStartedCount > 0 ? taskStartedCount : turnContextCount;
-
-    if (!meta) return null;
-
-    const ts = new Date(meta.timestamp);
-    const date = ts.toISOString().slice(0, 10);
-    const time = ts.toISOString().slice(11, 16);
-
+    const { date, time } = formatLocalDateTime(header.timestamp);
     return {
       date,
       time,
       turnCount,
-      source: meta.source || "unknown",
-      cwd: meta.cwd || "",
+      source: "cli",
+      cwd,
       filePath,
-      id: meta.id,
+      id: header.id,
     };
   } catch {
     return null;

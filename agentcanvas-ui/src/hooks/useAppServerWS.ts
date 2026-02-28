@@ -3,7 +3,6 @@ import { useGraphStore } from '../store/graphStore'
 import type { AppEvent } from '../lib/types'
 
 const MAX_BACKOFF = 30_000
-const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 
 // ---------------------------------------------------------------------------
 // Map a real app-server ThreadItem (camelCase JSON) → our internal AppEvent
@@ -80,7 +79,6 @@ export function useAppServerWS(overrideUrl?: string) {
   const url = overrideUrl ?? storeUrl
 
   useEffect(() => {
-    if (USE_MOCK) return  // skip WS entirely in mock mode
     if (!url) return       // no URL yet — wait for session selection
 
     unmountedRef.current = false
@@ -250,5 +248,5 @@ export function useAppServerWS(overrideUrl?: string) {
       unmountedRef.current = true
       wsRef.current?.close()
     }
-  }, [url])
+  }, [addEvent, setWsStatus, updateTurnLabel, url])
 }

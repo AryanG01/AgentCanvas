@@ -13,7 +13,8 @@
     "preview": "vite preview",
     "replay": "node scripts/ws-replay.mjs --latest --speed 10",
     "replay:list": "node scripts/list-sessions.mjs",
-    "replay:slow": "node scripts/ws-replay.mjs --latest --speed 1"
+    "replay:slow": "node scripts/ws-replay.mjs --latest --speed 1",
+    "dev:live:auto": "node scripts/dev-live-auto.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.10.1",

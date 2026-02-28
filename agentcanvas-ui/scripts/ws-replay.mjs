@@ -181,39 +181,121 @@ function findAllRollouts(dir) {
   return results;
 }
 
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function formatLocalDateTime(tsValue) {
+  const ts = new Date(tsValue);
+  if (Number.isNaN(ts.getTime())) {
+    return { date: "1970-01-01", time: "00:00" };
+  }
+  return {
+    date: `${ts.getFullYear()}-${pad2(ts.getMonth() + 1)}-${pad2(ts.getDate())}`,
+    time: `${pad2(ts.getHours())}:${pad2(ts.getMinutes())}`,
+  };
+}
+
+function extractMessageText(content) {
+  if (!Array.isArray(content)) return "";
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (typeof part.text === "string" && part.text.trim()) return part.text;
+  }
+  return "";
+}
+
+function isSetupMessage(text) {
+  const trimmed = text.trim();
+  return (
+    trimmed.startsWith("<user_instructions>") ||
+    trimmed.startsWith("<environment_context>") ||
+    trimmed.startsWith("<turn_aborted>") ||
+    trimmed.startsWith("# AGENTS.md instructions") ||
+    trimmed.startsWith("<permissions instructions>")
+  );
+}
+
+function extractCwdFromText(text) {
+  const m = text.match(/<cwd>([^<]+)<\/cwd>/);
+  return m?.[1]?.trim() || "";
+}
+
+function parseArgumentsObject(args) {
+  if (typeof args === "object" && args !== null) return args;
+  if (typeof args !== "string") return null;
+  try {
+    return JSON.parse(args);
+  } catch {
+    return null;
+  }
+}
+
 function readSessionInfo(filePath) {
   try {
     const content = readFileSync(filePath, "utf-8");
     const lines = content.split("\n").filter((l) => l.trim());
+    const parsed = [];
+    for (const line of lines) {
+      try {
+        parsed.push(JSON.parse(line));
+      } catch {
+        // skip malformed line
+      }
+    }
+    if (parsed.length === 0) return null;
 
     let meta = null;
     let taskStartedCount = 0;
     let turnContextCount = 0;
 
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        if (obj.type === "session_meta" && !meta) meta = obj.payload;
-        if (obj.type === "event_msg" && obj.payload?.type === "task_started") taskStartedCount++;
-        if (obj.type === "turn_context") turnContextCount++;
-      } catch {
-        // skip
+    for (const obj of parsed) {
+      if (obj.type === "session_meta" && !meta) meta = obj.payload;
+      if (obj.type === "event_msg" && obj.payload?.type === "task_started") taskStartedCount++;
+      if (obj.type === "turn_context") turnContextCount++;
+    }
+
+    if (meta) {
+      const turns = taskStartedCount > 0 ? taskStartedCount : turnContextCount;
+      const { date, time } = formatLocalDateTime(meta.timestamp);
+      return {
+        date,
+        time,
+        turns,
+        source: meta.source || "unknown",
+        cwd: meta.cwd || "",
+        file: filePath,
+        id: meta.id,
+      };
+    }
+
+    const header = parsed[0];
+    if (!header?.id || !header?.timestamp) return null;
+
+    let turns = 0;
+    let cwd = "";
+    for (const obj of parsed) {
+      if (obj.type === "message" && obj.role === "user") {
+        const text = extractMessageText(obj.content);
+        if (text && !isSetupMessage(text)) turns++;
+        if (!cwd && text) cwd = extractCwdFromText(text);
+      }
+      if (!cwd && obj.type === "function_call") {
+        const args = parseArgumentsObject(obj.arguments);
+        const argCwd = typeof args?.workdir === "string" ? args.workdir : "";
+        if (argCwd) cwd = argCwd;
       }
     }
 
-    if (!meta) return null;
-
-    const ts = new Date(meta.timestamp);
-    const turns = taskStartedCount > 0 ? taskStartedCount : turnContextCount;
-
+    const { date, time } = formatLocalDateTime(header.timestamp);
     return {
-      date: ts.toISOString().slice(0, 10),
-      time: ts.toISOString().slice(11, 16),
+      date,
+      time,
       turns,
-      source: meta.source || "unknown",
-      cwd: meta.cwd || "",
+      source: "cli",
+      cwd,
       file: filePath,
-      id: meta.id,
+      id: header.id,
     };
   } catch {
     return null;
@@ -277,7 +359,23 @@ function parseOutputJson(outputStr) {
   }
 }
 
-function buildReplayMessages(rolloutLines) {
+function extractOutputText(rawOutput) {
+  const parsedOutput = parseOutputJson(rawOutput);
+  if (typeof parsedOutput?.output === "string") return parsedOutput.output;
+  return rawOutput;
+}
+
+function extractExitCode(rawOutput) {
+  const parsedOutput = parseOutputJson(rawOutput);
+  if (typeof parsedOutput?.metadata?.exit_code === "number") {
+    return parsedOutput.metadata.exit_code;
+  }
+  const exitMatch = rawOutput.match(/Process exited with code (\d+)/);
+  if (exitMatch) return Number(exitMatch[1]);
+  return 0;
+}
+
+function buildReplayMessagesLegacy(rolloutLines) {
   const messages = [];
   let threadId = null;
   let currentTurnId = null;
@@ -534,11 +632,9 @@ function buildReplayMessages(rolloutLines) {
 
         ensureTurnOpen(ts);
         const name = call.name;
-        const output = p.output || "";
-
-        let exitCode = 0;
-        const exitMatch = output.match(/Process exited with code (\d+)/);
-        if (exitMatch) exitCode = Number(exitMatch[1]);
+        const rawOutput = p.output || "";
+        const output = extractOutputText(rawOutput);
+        const exitCode = extractExitCode(rawOutput);
 
         if (name === "shell_command" || name === "exec_command" || name === "shell" || name === "write_stdin") {
           const { command, cwd } = extractCommand(name, call.arguments);
@@ -731,6 +827,237 @@ function buildReplayMessages(rolloutLines) {
   }
 
   return messages;
+}
+
+function buildReplayMessagesModern(rolloutLines) {
+  const messages = [];
+  const pendingCalls = new Map();
+  const header = rolloutLines[0] || {};
+  const threadId = header.id || `thread-${Date.now()}`;
+  const startTs = header.timestamp || new Date().toISOString();
+  let currentTurnId = null;
+  let turnCounter = 0;
+
+  let cwd = typeof header.cwd === "string" ? header.cwd : "";
+  for (const line of rolloutLines) {
+    if (cwd) break;
+    if (line.type === "message" && line.role === "user") {
+      const text = extractMessageText(line.content);
+      if (text) cwd = extractCwdFromText(text);
+    }
+    if (!cwd && line.type === "function_call") {
+      const args = parseArgumentsObject(line.arguments);
+      if (typeof args?.workdir === "string") cwd = args.workdir;
+    }
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  messages.push({
+    ts: startTs,
+    msg: {
+      method: "thread/started",
+      params: {
+        thread: {
+          id: threadId,
+          preview: "",
+          ephemeral: false,
+          modelProvider: header.model_provider || "openai",
+          createdAt: now,
+          updatedAt: now,
+          status: "inProgress",
+          path: null,
+          cwd,
+          cliVersion: header.cli_version || "",
+          source: header.source || "cli",
+          agentNickname: null,
+          agentRole: null,
+          gitInfo: header.git
+            ? {
+                commitHash: header.git.commit_hash || "",
+                branch: header.git.branch || "",
+                repositoryUrl: header.git.repository_url || "",
+              }
+            : null,
+          name: null,
+          turns: [],
+        },
+      },
+    },
+  });
+
+  function startTurn(ts, userText = null) {
+    turnCounter++;
+    currentTurnId = `turn-${turnCounter}`;
+    messages.push({
+      ts,
+      msg: {
+        method: "turn/started",
+        params: {
+          threadId,
+          turn: { id: currentTurnId, items: [], status: "inProgress", error: null },
+        },
+      },
+    });
+    if (userText) {
+      messages.push({
+        ts,
+        msg: {
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId: currentTurnId,
+            item: {
+              type: "userMessage",
+              id: `user-${turnCounter}`,
+              content: [{ type: "text", text: userText }],
+            },
+          },
+        },
+      });
+    }
+  }
+
+  function closeTurn(ts, status = "completed") {
+    if (!currentTurnId) return;
+    messages.push({
+      ts,
+      msg: {
+        method: "turn/completed",
+        params: {
+          threadId,
+          turn: { id: currentTurnId, items: [], status, error: null },
+        },
+      },
+    });
+    currentTurnId = null;
+  }
+
+  function ensureTurnOpen(ts) {
+    if (!currentTurnId) startTurn(ts);
+  }
+
+  for (const line of rolloutLines.slice(1)) {
+    const ts = line.timestamp || startTs;
+
+    if (line.type === "message" && line.role === "user") {
+      const text = extractMessageText(line.content);
+      if (!text || isSetupMessage(text)) continue;
+      if (currentTurnId) closeTurn(ts);
+      startTurn(ts, text);
+      continue;
+    }
+
+    if (line.type === "function_call") {
+      pendingCalls.set(line.call_id, { name: line.name || "", arguments: line.arguments || "" });
+      ensureTurnOpen(ts);
+      continue;
+    }
+
+    if (line.type === "function_call_output") {
+      const call = pendingCalls.get(line.call_id);
+      pendingCalls.delete(line.call_id);
+      if (!call) continue;
+
+      ensureTurnOpen(ts);
+      const rawOutput = line.output || "";
+      const output = extractOutputText(rawOutput);
+      const exitCode = extractExitCode(rawOutput);
+      const callArgs = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments);
+
+      if (call.name === "shell_command" || call.name === "exec_command" || call.name === "shell" || call.name === "write_stdin") {
+        const { command, cwd: cmdCwd } = extractCommand(call.name, callArgs);
+        messages.push({
+          ts,
+          msg: {
+            method: "item/completed",
+            params: {
+              threadId,
+              turnId: currentTurnId,
+              item: {
+                type: "commandExecution",
+                id: line.call_id,
+                command,
+                cwd: cmdCwd || "",
+                processId: null,
+                status: exitCode === 0 ? "completed" : "failed",
+                commandActions: [],
+                aggregatedOutput: output,
+                exitCode,
+                durationMs: null,
+              },
+            },
+          },
+        });
+        continue;
+      }
+
+      if (call.name === "apply_patch") {
+        const filePaths = extractFilePaths(callArgs);
+        messages.push({
+          ts,
+          msg: {
+            method: "item/completed",
+            params: {
+              threadId,
+              turnId: currentTurnId,
+              item: {
+                type: "fileChange",
+                id: line.call_id,
+                changes: filePaths.map((fp) => ({
+                  path: fp,
+                  kind: { type: "update", move_path: null },
+                  diff: callArgs,
+                })),
+                status: exitCode === 0 ? "completed" : "failed",
+              },
+            },
+          },
+        });
+        continue;
+      }
+
+      let parsedArgs = {};
+      try {
+        parsedArgs = JSON.parse(callArgs);
+      } catch {
+        parsedArgs = { input: callArgs };
+      }
+
+      messages.push({
+        ts,
+        msg: {
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId: currentTurnId,
+            item: {
+              type: "mcpToolCall",
+              id: line.call_id,
+              server: "unknown",
+              tool: call.name,
+              status: exitCode === 0 ? "completed" : "failed",
+              arguments: parsedArgs,
+              result: { type: "text", text: output },
+              error: null,
+              durationMs: null,
+            },
+          },
+        },
+      });
+    }
+  }
+
+  const lastTs = rolloutLines[rolloutLines.length - 1]?.timestamp || startTs;
+  closeTurn(lastTs);
+
+  return messages;
+}
+
+function buildReplayMessages(rolloutLines) {
+  const isLegacy = rolloutLines.some(
+    (l) => l.type === "session_meta" || l.type === "event_msg" || l.type === "response_item" || l.type === "turn_context",
+  );
+  return isLegacy ? buildReplayMessagesLegacy(rolloutLines) : buildReplayMessagesModern(rolloutLines);
 }
 
 function loadAndBuild(filePath) {
