@@ -30,9 +30,73 @@ const portArg = args[args.indexOf('--port') + 1]
 const threadIdArg = args[args.indexOf('--thread-id') + 1]
 const PORT = portArg ? parseInt(portArg) : 8080
 const SUMMARY_DIR = join(homedir(), '.codex', 'agentcanvas', 'summaries')
+const MAX_SYNTHETIC_SUMMARY_CHARS = 400
 
 function sanitizePathComponent(value) {
   return String(value).replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+function normalizeSummaryText(value) {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_SYNTHETIC_SUMMARY_CHARS)
+}
+
+function makeFallbackSummaryNode(threadId, turnId, status, summaryText = '') {
+  const normalized = normalizeSummaryText(summaryText)
+  const brief = normalized || `${status} turn`
+
+  return {
+    schema_version: 'agentcanvas.turn.v2',
+    summary_kind: 'agentcanvas_turn_summary',
+    thread_id: threadId,
+    session_id: turnId,
+    forked_from_thread_id: null,
+    nodes: [
+      {
+        node_id: `turn:${turnId}`,
+        parent_id: null,
+        node_type: 'turn',
+        title: `Turn ${turnId}`,
+        summary: brief,
+        status,
+        brief: {
+          signal: status === 'interrupted' ? 'error' : 'status_only',
+          agent_message: brief,
+          primary_command: null,
+          primary_file_path: null,
+          primary_error: status === 'interrupted' ? brief : null,
+        },
+        lineage: {
+          parent_turn_id: null,
+          forked_from_thread_id: null,
+          started_after_rollback: false,
+        },
+        counts: {
+          commands_total: 0,
+          commands_indexed: 0,
+          commands_omitted: 0,
+          file_paths_total: 0,
+          file_paths_indexed: 0,
+          file_paths_omitted: 0,
+          errors_total: 0,
+          errors_indexed: 0,
+          errors_omitted: 0,
+        },
+        digest: {
+          command_examples: [],
+          file_path_examples: [],
+          error_examples: [],
+        },
+        evidence: {
+          file_paths: [],
+          commands: [],
+          errors: [],
+        },
+      },
+    ],
+  }
 }
 
 function readTurnSummaryNode(threadIdValue, turnIdValue) {
@@ -56,10 +120,17 @@ function readTurnSummaryNode(threadIdValue, turnIdValue) {
   }
 }
 
+function extractAgentMessage(item) {
+  if (!item || typeof item !== 'object') return null
+  if (item.type === 'agentMessage' && typeof item.text === 'string') return item.text
+  return null
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let nextId = 1
 let threadId = threadIdArg ?? null
 let turnId = null
+const turnCompletedAgentMessages = new Map()
 const clients = new Set()
 
 // ── Spawn codex proto ─────────────────────────────────────────────────────────
@@ -117,7 +188,14 @@ rl.on('line', (line) => {
 
   if (msg.method === 'turn/completed') {
     const completedTurnId = msg.params?.turn?.id ?? turnId
-    const summaryNode = readTurnSummaryNode(threadId, completedTurnId)
+    const status = msg.params?.turn?.status ?? 'completed'
+    const persisted = readTurnSummaryNode(threadId, completedTurnId)
+    const messageText = completedTurnId ? turnCompletedAgentMessages.get(completedTurnId) : null
+    const summaryNode = persisted
+      ?? makeFallbackSummaryNode(threadId ?? '', completedTurnId, status, messageText ?? '')
+    if (completedTurnId) {
+      turnCompletedAgentMessages.delete(completedTurnId)
+    }
     if (summaryNode) {
       broadcast({
         method: 'agentcanvas/summaryNode',
@@ -127,6 +205,15 @@ rl.on('line', (line) => {
           node: summaryNode,
         },
       })
+    }
+  }
+
+  if (msg.method === 'item/completed') {
+    const item = msg.params?.item
+    const itemTurnId = msg.params?.turnId
+    const text = extractAgentMessage(item)
+    if (itemTurnId && text) {
+      turnCompletedAgentMessages.set(itemTurnId, text)
     }
   }
 
