@@ -28,6 +28,7 @@ use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::sort_agent_picker_threads;
+use crate::websocket_broadcaster;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -1376,6 +1377,11 @@ impl App {
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
         should_prompt_windows_sandbox_nux_at_startup: bool,
+        websocket_port: u16,
+        ui_enabled: bool,
+        ui_port: u16,
+        ui_dist_path: Option<PathBuf>,
+        no_browser: bool,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
@@ -1560,6 +1566,73 @@ impl App {
                 ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
             }
         };
+
+        // Spawn WebSocket event streaming for active thread
+        if let Some(thread_id) = chat_widget.thread_id() {
+            if let Ok(thread) = thread_manager.get_thread(thread_id).await {
+                match websocket_broadcaster::spawn_websocket_infrastructure(
+                    websocket_port,
+                    thread,
+                )
+                .await
+                {
+                    Ok(_) => tracing::info!(
+                        "WebSocket event streaming on ws://127.0.0.1:{}",
+                        websocket_port
+                    ),
+                    Err(err) => tracing::warn!(
+                        "WebSocket server failed to start: {}. Continuing without streaming.",
+                        err
+                    ),
+                }
+            }
+        }
+
+        // Spawn HTTP server and auto-open browser if UI is enabled
+        if ui_enabled {
+            if let Some(dist_path) = ui_dist_path {
+                // Convert to absolute path
+                let abs_dist_path = match dunce::canonicalize(&dist_path) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to resolve UI dist path '{}': {}. Continuing without UI.",
+                            dist_path.display(),
+                            e
+                        );
+                        None
+                    }
+                };
+
+                if let Some(abs_path) = abs_dist_path {
+                    match crate::http_server::spawn_http_server(ui_port, abs_path).await {
+                        Ok(_) => {
+                            tracing::info!(
+                                "AgentCanvas UI available at http://127.0.0.1:{}",
+                                ui_port
+                            );
+
+                            // Auto-open browser if not disabled
+                            if !no_browser {
+                                let url = format!("http://127.0.0.1:{}", ui_port);
+                                if let Err(err) = webbrowser::open(&url) {
+                                    tracing::warn!("Failed to open browser: {}", err);
+                                }
+                            }
+                        }
+                        Err(err) => tracing::warn!(
+                            "AgentCanvas UI HTTP server failed to start: {}. Continuing without UI.",
+                            err
+                        ),
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "AgentCanvas UI enabled but no dist path provided. \n\
+                    Use --ui-dist to specify the path to agentcanvas-ui/dist/"
+                );
+            }
+        }
 
         chat_widget
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);

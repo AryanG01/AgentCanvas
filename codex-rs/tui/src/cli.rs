@@ -110,6 +110,26 @@ pub struct Cli {
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
+    /// Port for WebSocket event streaming server.
+    #[arg(long = "websocket-port", default_value_t = 3737)]
+    pub websocket_port: u16,
+
+    /// Enable AgentCanvas UI visualization (serves web UI and auto-opens browser)
+    #[arg(long = "ui", default_value_t = false)]
+    pub ui_enabled: bool,
+
+    /// Port for AgentCanvas UI HTTP server
+    #[arg(long = "ui-port", default_value_t = 8080)]
+    pub ui_port: u16,
+
+    /// Path to AgentCanvas UI dist/ folder
+    #[arg(long = "ui-dist", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub ui_dist_path: Option<PathBuf>,
+
+    /// Disable auto-opening browser when UI is enabled
+    #[arg(long = "no-browser", default_value_t = false)]
+    pub no_browser: bool,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

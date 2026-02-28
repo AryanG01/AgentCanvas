@@ -75,6 +75,8 @@ mod color;
 pub mod custom_terminal;
 mod cwd_prompt;
 mod debug_config;
+mod websocket_broadcaster;
+mod http_server;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
@@ -914,6 +916,11 @@ async fn run_ratatui_app(
         prompt,
         images,
         no_alt_screen,
+        websocket_port,
+        ui_enabled,
+        ui_port,
+        ui_dist_path,
+        no_browser,
         ..
     } = cli;
 
@@ -933,6 +940,11 @@ async fn run_ratatui_app(
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,
+        websocket_port,
+        ui_enabled,
+        ui_port,
+        ui_dist_path,
+        no_browser,
     )
     .await;
 
