@@ -77,6 +77,7 @@ export interface SummaryNodeEvent {
   type: 'SummaryNode'
   id: string
   turnId: string
+  nodeType: 'turn' | 'phase'
   status: string
   summaryText: string
   brief: {
@@ -104,11 +105,14 @@ export interface SummaryNodeEvent {
   }
   lineage: {
     parentTurnId: string | null
+    childTurnId: string | null
+    childTurnIds: string[]
     forkedFromThreadId: string | null
     startedAfterRollback: boolean
     wasRolledBack: boolean
   }
   evidence: {
+    childTurnIds: string[]
     filePaths: string[]
     commands: Array<{ command: string; exitCode: number | null }>
     errors: string[]
@@ -139,7 +143,7 @@ export type AppEvent =
 // Graph node types
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error' | 'summary'
+export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error' | 'summary' | 'phase'
 
 export interface GraphNodeData extends Record<string, unknown> {
   kind: NodeKind

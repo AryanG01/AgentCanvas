@@ -27,11 +27,12 @@ export function EvidencePanel() {
     plan:    'text-zinc-400',
     error:   'text-red-400',
     summary: 'text-fuchsia-400',
+    phase:   'text-violet-400',
   }
 
   const kindLabels: Record<string, string> = {
     turn: 'TURN', command: 'CMD', tool: 'MCP TOOL',
-    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR', summary: 'SUMMARY',
+    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR', summary: 'SUMMARY', phase: 'PHASE',
   }
 
   return (
@@ -64,6 +65,8 @@ export function EvidencePanel() {
           <PatchDetail event={rawEvent as PatchApplyEvent} />
         ) : kind === 'plan' ? (
           <PlanDetail event={rawEvent as PlanUpdateEvent} />
+        ) : kind === 'phase' ? (
+          <PhaseDetail event={rawEvent as SummaryNodeEvent} />
         ) : kind === 'summary' ? (
           <SummaryDetail event={rawEvent as SummaryNodeEvent} />
         ) : kind === 'turn' ? (
@@ -258,6 +261,28 @@ function SummaryDetail({ event }: { event: SummaryNodeEvent }) {
         <CodeBlock>{JSON.stringify(event.lineage, null, 2)}</CodeBlock>
       </Section>
 
+      <Section title="Evidence">
+        <CodeBlock>{JSON.stringify(event.evidence, null, 2)}</CodeBlock>
+      </Section>
+    </>
+  )
+}
+
+function PhaseDetail({ event }: { event: SummaryNodeEvent }) {
+  const childTurnIds = event.lineage.childTurnIds.length > 0
+    ? event.lineage.childTurnIds
+    : event.evidence.childTurnIds
+  return (
+    <>
+      <Section title="Phase Summary">
+        <CodeBlock className="text-violet-200">{event.summaryText || '(empty)'}</CodeBlock>
+      </Section>
+      <Section title="Child Turns">
+        <CodeBlock>{JSON.stringify(childTurnIds, null, 2)}</CodeBlock>
+      </Section>
+      <Section title="Digest">
+        <CodeBlock>{JSON.stringify(event.digest, null, 2)}</CodeBlock>
+      </Section>
       <Section title="Evidence">
         <CodeBlock>{JSON.stringify(event.evidence, null, 2)}</CodeBlock>
       </Section>

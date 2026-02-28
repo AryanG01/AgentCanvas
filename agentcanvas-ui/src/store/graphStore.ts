@@ -76,7 +76,18 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   ...initialState,
 
   addEvent: (event) => {
-    const events = [...get().events, event]
+    const events = event.type === 'SummaryNode'
+      ? [
+          ...get().events.filter(existing =>
+            existing.type !== 'SummaryNode'
+            || !(
+              existing.id === event.id
+              || (existing.turnId === event.turnId && existing.nodeType === event.nodeType)
+            )
+          ),
+          event,
+        ]
+      : [...get().events, event]
     set(recompute(events, get().expandedTurns))
   },
 

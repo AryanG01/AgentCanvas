@@ -58,6 +58,10 @@ AgentCanvas session summaries.
   - deterministic summary id = `agentcanvas.turn:<thread_id>:<turn_id>`
 - Summary payloads now use `schema_version = "agentcanvas.turn.v2"` and include:
   - top-level `summary_kind = "agentcanvas_turn_summary"`
+  - `nodes[].summary` now follows a stable three-part format for readability + parsing:
+    - `Outcome: ...`
+    - `Evidence: ...`
+    - `Lineage: ...`
   - per-node parse-oriented fields: `brief`, `lineage`, `counts`, `digest`, `evidence`
   - bounded evidence arrays with explicit `*_omitted` counts so payloads stay concise.
   - no top-level `node_type`; only actual summary nodes are stored under `nodes[]`.

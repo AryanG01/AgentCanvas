@@ -42,6 +42,7 @@ const summaryNode: AppEvent = {
   type: 'SummaryNode',
   id: 'turn:t1',
   turnId: 't1',
+  nodeType: 'turn',
   status: 'completed',
   summaryText: 'status=completed; signal=execution; command=cargo test -p codex-core',
   brief: {
@@ -69,16 +70,74 @@ const summaryNode: AppEvent = {
   },
   lineage: {
     parentTurnId: null,
+    childTurnId: null,
+    childTurnIds: [],
     forkedFromThreadId: null,
     startedAfterRollback: false,
     wasRolledBack: false,
   },
   evidence: {
+    childTurnIds: [],
     filePaths: [],
     commands: [{ command: 'cargo test -p codex-core', exitCode: 0 }],
     errors: [],
   },
   ts: 1003,
+}
+
+const secondTurnStarted: AppEvent = {
+  type: 'TurnStarted',
+  turnId: 't2',
+  sessionId: 's1',
+  userPrompt: 'Fix failing test',
+  ts: 1004,
+}
+
+const phaseSummaryNode: AppEvent = {
+  type: 'SummaryNode',
+  id: 'phase:phase-0',
+  turnId: 't2',
+  nodeType: 'phase',
+  status: 'completed',
+  summaryText: 'Outcome: fixed regression. Evidence: edited tests. Lineage: grouped turns.',
+  brief: {
+    signal: 'execution',
+    agentMessage: null,
+    primaryCommand: 'cargo test -p codex-core',
+    primaryFilePath: 'core/src/lib.rs',
+    primaryError: null,
+  },
+  counts: {
+    commandsTotal: 2,
+    commandsIndexed: 2,
+    commandsOmitted: 0,
+    filePathsTotal: 1,
+    filePathsIndexed: 1,
+    filePathsOmitted: 0,
+    errorsTotal: 0,
+    errorsIndexed: 0,
+    errorsOmitted: 0,
+  },
+  digest: {
+    commandExamples: ['cargo test -p codex-core'],
+    filePathExamples: ['core/src/lib.rs'],
+    errorExamples: [],
+  },
+  lineage: {
+    parentTurnId: null,
+    childTurnId: null,
+    childTurnIds: ['t1', 't2'],
+    forkedFromThreadId: null,
+    startedAfterRollback: false,
+    wasRolledBack: false,
+  },
+  evidence: {
+    childTurnIds: ['t1', 't2'],
+    filePaths: ['core/src/lib.rs'],
+    commands: [{ command: 'cargo test -p codex-core', exitCode: 0 }],
+    errors: [],
+  },
+  ts: 1005,
 }
 
 describe('buildGraph', () => {
@@ -120,6 +179,19 @@ describe('buildGraph', () => {
     expect(summary?.data.kind).toBe('summary')
     const detailEdge = edges.find(e => e.target === 'summary-t1')
     expect(detailEdge?.source).toBe('turn-t1')
+  })
+
+  it('adds a phase node connected to child turns', () => {
+    const { nodes, edges } = buildGraph([
+      threadStarted,
+      turnStarted,
+      secondTurnStarted,
+      phaseSummaryNode,
+    ])
+    const phaseNode = nodes.find(n => n.data.kind === 'phase')
+    expect(phaseNode).toBeDefined()
+    const phaseEdges = edges.filter(e => e.target === phaseNode?.id)
+    expect(phaseEdges.length).toBe(2)
   })
 
   it('returns no nodes for empty events', () => {

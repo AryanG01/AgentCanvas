@@ -14,16 +14,31 @@ use tokio::time::Duration;
 use std::collections::BTreeMap;
 
 pub(crate) const TURN_SUMMARY_LLM_MODEL: &str = "gpt-4.1-nano";
-const TURN_SUMMARY_MAX_TOKENS: u16 = 256;
-const TURN_SUMMARY_LLM_TIMEOUT_SECS: u64 = 8;
+const TURN_SUMMARY_BASE_MAX_TOKENS: u16 = 512;
+const TURN_SUMMARY_PER_TURN_TOKENS: u16 = 96;
+const TURN_SUMMARY_HARD_MAX_TOKENS: u16 = 2_048;
+const TURN_SUMMARY_LLM_TIMEOUT_SECS: u64 = 15;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "\
-Summarize each agent turn in 1-2 concise sentences. Each input object contains
-structured evidence from one turn (status, parent/child lineage, errors, commands,
-files, and messages). Include concrete outcomes and mention lineage context when it
-changes execution direction (\"parent\" or \"child\" relation, forks, rollback state).
-Return a JSON array where each item has fields: `turn_id` and `summary`. \
+You are generating high-signal hierarchical summaries for coding-agent turns.
+Each input object includes direct turn evidence plus parent/child snapshots.
+For each turn summary, use this exact format:
+Outcome: <primary result>. Evidence: <key commands/files/errors>. Lineage: <parent/child/fork/rollback context>.
+Keep summaries concise and concrete (1-3 short sentences), do not invent facts, and
+prioritize failures or behavior changes before generic status text.
+Return a JSON array where each item has fields `turn_id` and `summary`.
 Return ONLY JSON, no markdown fences, no extra text.";
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TurnSummarySnapshot {
+    pub(crate) turn_id: String,
+    pub(crate) status: String,
+    pub(crate) signal: String,
+    pub(crate) summary_hint: Option<String>,
+    pub(crate) primary_command: Option<String>,
+    pub(crate) primary_file_path: Option<String>,
+    pub(crate) primary_error: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TurnSummaryEvidence {
@@ -41,6 +56,11 @@ pub(crate) struct TurnSummaryEvidence {
     pub(crate) total_commands: usize,
     pub(crate) total_file_paths: usize,
     pub(crate) total_errors: usize,
+    pub(crate) command_examples: Vec<String>,
+    pub(crate) file_path_examples: Vec<String>,
+    pub(crate) error_examples: Vec<String>,
+    pub(crate) parent_turn_snapshot: Option<TurnSummarySnapshot>,
+    pub(crate) child_turn_snapshot: Option<TurnSummarySnapshot>,
 }
 
 #[derive(Debug, Error)]
@@ -73,14 +93,17 @@ pub(crate) async fn generate_turn_summaries(
     }
     if std::env::var("OPENAI_API_KEY")
         .ok()
+        .as_deref()
         .is_none_or(str::is_empty)
     {
         return Err(TurnSummaryLlmError::MissingApiKey);
     }
 
+    let completion_tokens = calculate_completion_token_budget(turns.len());
+
     let request = CreateChatCompletionRequestArgs::default()
         .model(TURN_SUMMARY_LLM_MODEL)
-        .max_completion_tokens(u32::from(TURN_SUMMARY_MAX_TOKENS))
+        .max_completion_tokens(u32::from(completion_tokens))
         .temperature(0.3)
         .messages(vec![
             ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -121,6 +144,15 @@ pub(crate) async fn generate_turn_summaries(
     Ok(map)
 }
 
+fn calculate_completion_token_budget(turn_count: usize) -> u16 {
+    let base_tokens = usize::from(TURN_SUMMARY_BASE_MAX_TOKENS);
+    let per_turn_tokens = usize::from(TURN_SUMMARY_PER_TURN_TOKENS);
+    let hard_max_tokens = usize::from(TURN_SUMMARY_HARD_MAX_TOKENS);
+    let requested = base_tokens.saturating_add(turn_count.saturating_mul(per_turn_tokens));
+    let capped = requested.min(hard_max_tokens);
+    u16::try_from(capped).unwrap_or(TURN_SUMMARY_HARD_MAX_TOKENS)
+}
+
 fn parse_summary_items(raw_response: &str) -> Result<Vec<SummaryItem>, String> {
     let trimmed = raw_response.trim();
     if let Ok(items) = serde_json::from_str::<Vec<SummaryItem>>(trimmed) {
@@ -142,6 +174,7 @@ fn parse_summary_items(raw_response: &str) -> Result<Vec<SummaryItem>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn build_turn_summary_prompt_is_valid_json() {
@@ -160,6 +193,19 @@ mod tests {
             total_commands: 1,
             total_file_paths: 2,
             total_errors: 0,
+            command_examples: vec!["rg summary".to_string()],
+            file_path_examples: vec!["src/main.rs".to_string()],
+            error_examples: vec![],
+            parent_turn_snapshot: None,
+            child_turn_snapshot: Some(TurnSummarySnapshot {
+                turn_id: "turn-2".to_string(),
+                status: "in_progress".to_string(),
+                signal: "status_only".to_string(),
+                summary_hint: Some("continue with tests".to_string()),
+                primary_command: Some("cargo test -p codex-core".to_string()),
+                primary_file_path: None,
+                primary_error: None,
+            }),
         }];
 
         let prompt = build_turn_summary_prompt(&evidence);
@@ -168,6 +214,10 @@ mod tests {
         assert_eq!(parsed.as_array().expect("should be array").len(), 1);
         assert_eq!(parsed[0]["turn_id"], "turn-1");
         assert_eq!(parsed[0]["status"], "completed");
+        assert_eq!(
+            parsed[0]["child_turn_snapshot"]["turn_id"],
+            serde_json::json!("turn-2")
+        );
     }
 
     #[test]
@@ -177,5 +227,14 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].turn_id, "turn-1");
         assert_eq!(items[0].summary, "summary text");
+    }
+
+    #[test]
+    fn completion_budget_scales_with_turn_count() {
+        assert_eq!(calculate_completion_token_budget(1), 608);
+        assert_eq!(
+            calculate_completion_token_budget(30),
+            TURN_SUMMARY_HARD_MAX_TOKENS
+        );
     }
 }

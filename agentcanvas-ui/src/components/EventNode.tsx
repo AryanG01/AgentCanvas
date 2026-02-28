@@ -48,6 +48,13 @@ const kindConfig: Record<NodeKind, KindConfig> = {
     border: 'border-fuchsia-700/40',
     iconBg: 'bg-fuchsia-900/50 text-fuchsia-300',
   },
+  phase: {
+    icon: 'Φ',
+    badge: 'bg-violet-900/60 text-violet-300 border border-violet-700/40',
+    badgeText: 'PHASE',
+    border: 'border-violet-700/40',
+    iconBg: 'bg-violet-900/50 text-violet-300',
+  },
   error: {
     icon: '✕',
     badge: 'bg-red-900/60 text-red-300 border border-red-700/40',

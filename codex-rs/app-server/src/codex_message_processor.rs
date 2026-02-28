@@ -6609,10 +6609,39 @@ impl CodexMessageProcessor {
             codex_home,
             single_client_mode,
         } = listener_task_context;
+        let mut summary_rx = conversation.take_rollout_summary_receiver().await;
         let outgoing_for_task = Arc::clone(&outgoing);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    summary_update = async {
+                        let Some(summary_rx) = summary_rx.as_mut() else {
+                            return None;
+                        };
+                        summary_rx.recv().await
+                    }, if summary_rx.is_some() => {
+                        let Some(summary_update) = summary_update else {
+                            summary_rx = None;
+                            continue;
+                        };
+                        let Some(params) = Self::build_agentcanvas_summary_notification_params(&summary_update) else {
+                            continue;
+                        };
+                        let subscribed_connection_ids = thread_state_manager
+                            .subscribed_connection_ids(conversation_id)
+                            .await;
+                        if !subscribed_connection_ids.is_empty() {
+                            outgoing_for_task
+                                .send_notification_to_connections(
+                                    &subscribed_connection_ids,
+                                    OutgoingNotification {
+                                        method: "agentcanvas/summaryNode".to_string(),
+                                        params: Some(params),
+                                    },
+                                )
+                                .await;
+                        }
+                    }
                     _ = &mut cancel_rx => {
                         // Listener was superseded or the thread is being torn down.
                         break;
@@ -6724,6 +6753,52 @@ impl CodexMessageProcessor {
             }
         });
     }
+
+    fn build_agentcanvas_summary_notification_params(
+        summary: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let thread_id = summary.get("thread_id")?.as_str()?;
+        let session_id = summary
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)?;
+        let node = summary
+            .get("nodes")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|nodes| nodes.first())
+            .cloned()?;
+        let (anchor_turn_id, child_turn_id, child_turn_ids_last) =
+            if let Some(lineage) = node.get("lineage").and_then(serde_json::Value::as_object) {
+                (
+                    lineage
+                        .get("anchor_turn_id")
+                        .and_then(serde_json::Value::as_str),
+                    lineage
+                        .get("child_turn_id")
+                        .and_then(serde_json::Value::as_str),
+                    lineage
+                        .get("child_turn_ids")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|turn_ids| turn_ids.last())
+                        .and_then(serde_json::Value::as_str),
+                )
+            } else {
+                (None, None, None)
+            };
+        let turn_id = if session_id.starts_with("phase:") {
+            anchor_turn_id
+                .or(child_turn_ids_last)
+                .or(child_turn_id)
+                .unwrap_or(session_id)
+        } else {
+            session_id
+        };
+        Some(serde_json::json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "node": node,
+        }))
+    }
+
     async fn git_diff_to_origin(&self, request_id: ConnectionRequestId, cwd: PathBuf) {
         let diff = git_diff_to_remote(&cwd).await;
         match diff {

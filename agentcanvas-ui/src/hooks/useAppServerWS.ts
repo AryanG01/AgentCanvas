@@ -146,11 +146,19 @@ export function useAppServerWS(overrideUrl?: string) {
             const lineage = (node.lineage as Record<string, unknown>) ?? {}
             const evidence = (node.evidence as Record<string, unknown>) ?? {}
             const commands = Array.isArray(evidence.commands) ? evidence.commands : []
+            const childTurnIds = Array.isArray(lineage.child_turn_ids)
+              ? lineage.child_turn_ids.filter((value): value is string => typeof value === 'string')
+              : []
+            const evidenceChildTurnIds = Array.isArray(evidence.child_turn_ids)
+              ? evidence.child_turn_ids.filter((value): value is string => typeof value === 'string')
+              : []
+            const nodeType = (node.node_type as string) === 'phase' ? 'phase' : 'turn'
 
             addEvent({
               type: 'SummaryNode',
               id: (node.node_id as string) ?? `summary-${turnId}`,
               turnId,
+              nodeType,
               status: (node.status as string) ?? 'unknown',
               summaryText: (node.summary as string) ?? '',
               brief: {
@@ -184,11 +192,14 @@ export function useAppServerWS(overrideUrl?: string) {
               },
               lineage: {
                 parentTurnId: (lineage.parent_turn_id as string) ?? null,
+                childTurnId: (lineage.child_turn_id as string) ?? null,
+                childTurnIds,
                 forkedFromThreadId: (lineage.forked_from_thread_id as string) ?? null,
                 startedAfterRollback: Boolean(lineage.started_after_rollback),
                 wasRolledBack: Boolean(lineage.was_rolled_back),
               },
               evidence: {
+                childTurnIds: evidenceChildTurnIds,
                 filePaths: Array.isArray(evidence.file_paths)
                   ? evidence.file_paths.filter((value): value is string => typeof value === 'string')
                   : [],
