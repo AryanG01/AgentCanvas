@@ -1,0 +1,19 @@
+{"type":"thread.started","thread_id":"test-thread-multi"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"agent_message","text":""}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll start by creating a plan."}}
+{"type":"item.started","item":{"id":"item_1","type":"todo_list","items":[{"item":"Read source files","status":"in_progress"},{"item":"Implement feature","status":"in_progress"}]}}
+{"type":"item.completed","item":{"id":"item_1","type":"todo_list","items":[{"item":"Read source files","status":"completed"},{"item":"Implement feature","status":"in_progress"}]}}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"cat src/main.rs","status":"in_progress","aggregated_output":"","exit_code":null}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"cat src/main.rs","status":"completed","aggregated_output":"fn main() {}\n","exit_code":0}}
+{"type":"turn.completed","usage":{"input_tokens":200,"cached_input_tokens":100,"output_tokens":50}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_3","type":"agent_message","text":""}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Now implementing the feature."}}
+{"type":"item.started","item":{"id":"item_4","type":"file_change","changes":[{"path":"src/main.rs","kind":"update"},{"path":"src/lib.rs","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_4","type":"file_change","changes":[{"path":"src/main.rs","kind":"update"},{"path":"src/lib.rs","kind":"add"}],"status":"completed"}}
+{"type":"item.started","item":{"id":"item_5","type":"command_execution","command":"cargo test","status":"in_progress","aggregated_output":"","exit_code":null}}
+{"type":"item.completed","item":{"id":"item_5","type":"command_execution","command":"cargo test","status":"completed","aggregated_output":"test result: ok. 2 passed\n","exit_code":0}}
+{"type":"item.started","item":{"id":"item_6","type":"todo_list","items":[{"item":"Read source files","status":"completed"},{"item":"Implement feature","status":"completed"}]}}
+{"type":"item.completed","item":{"id":"item_6","type":"todo_list","items":[{"item":"Read source files","status":"completed"},{"item":"Implement feature","status":"completed"}]}}
+{"type":"turn.completed","usage":{"input_tokens":400,"cached_input_tokens":200,"output_tokens":80}}

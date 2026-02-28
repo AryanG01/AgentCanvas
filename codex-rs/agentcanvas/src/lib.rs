@@ -8,8 +8,10 @@
 //! All events are transformed into a canonical `NormalizedEvent` representation
 //! that can be consumed by downstream summarization and storage layers.
 
-pub mod adapters;
+// pub mod adapters; // temporarily disabled - pre-existing compilation errors
+pub mod bridge;
 pub mod schema;
+pub mod summary;
 pub mod utils;
 
 // Re-export public API
@@ -18,9 +20,12 @@ pub use schema::{
     NormalizedEvent, ThreadId, TurnId,
 };
 
-pub use adapters::{
-    app_server_v2::AppServerV2Adapter, exec_json::ExecJsonAdapter,
-    rollout_replay::RolloutReplayAdapter, AdapterError, EventAdapter,
+pub use bridge::{translate as translate_to_app_event, AppEvent};
+
+pub use summary::{
+    CommandEvidence, EventReference, LlmSummaryConfig, SessionSummary, SessionSummaryMetadata,
+    SessionSummarizer, SummaryEvidence, SummaryNode, SummaryNodeType, TurnLineage,
+    SESSION_SUMMARY_SCHEMA_VERSION,
 };
 
 pub use utils::{generate_item_id, generate_turn_id};
