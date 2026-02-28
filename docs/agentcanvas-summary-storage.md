@@ -56,6 +56,15 @@ AgentCanvas session summaries.
   - `thread_id` = session thread id
   - `session_id` = turn id
   - deterministic summary id = `agentcanvas.turn:<thread_id>:<turn_id>`
+- Summary payloads now use `schema_version = "agentcanvas.turn.v2"` and include:
+  - top-level `summary_kind = "agentcanvas_turn_summary"`
+  - per-node parse-oriented fields: `brief`, `lineage`, `counts`, `digest`, `evidence`
+  - bounded evidence arrays with explicit `*_omitted` counts so payloads stay concise.
+  - no top-level `node_type`; only actual summary nodes are stored under `nodes[]`.
+  - `brief` is a stable compact contract for agent/human readers:
+    - `signal`: `error` | `code_changes` | `execution` | `status_only`
+    - `agent_message`: optional bounded assistant summary text
+    - `primary_command`, `primary_file_path`, `primary_error`: optional top examples
 
 All query methods return indexed node matches with:
 
@@ -74,10 +83,10 @@ All query methods return indexed node matches with:
   - `id` plus summary-node structure (`parent_id`, `children`, `nodes`, etc.)
 - Evidence indexing is key-based:
   - file path keys: `file`, `files`, `file_path`, `file_paths`, `filepath`,
-    `filepaths`, `path`, `paths`
-  - command keys: `command`, `commands`, `cmd`
+    `filepaths`, `path`, `paths`, `primary_file_path`
+  - command keys: `command`, `commands`, `cmd`, `primary_command`
   - error keys: `error`, `errors`, `error_text`, `errortext`, `last_error`,
-    `stderr`
+    `stderr`, `primary_error`
 - Semantic indexing is lightweight/local:
   - configured embedding model id: `jina-embeddings-v5-text-nano`.
   - sparse fallback index: hashed token vectors stored in `summary_node_semantic_terms`.

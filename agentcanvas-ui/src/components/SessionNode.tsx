@@ -1,8 +1,10 @@
 import { memo } from 'react'
-import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
 import type { GraphNodeData } from '../lib/types'
 
-export const SessionNode = memo(({ data, selected }: NodeProps<GraphNodeData>) => {
+type GraphNode = Node<GraphNodeData>
+
+export const SessionNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
   return (
     <div
       className={`

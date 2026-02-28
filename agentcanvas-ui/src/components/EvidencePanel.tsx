@@ -5,6 +5,7 @@ import type {
   McpToolCallEvent,
   PatchApplyEvent,
   PlanUpdateEvent,
+  SummaryNodeEvent,
   TurnStartedEvent,
 } from '../lib/types'
 
@@ -25,11 +26,12 @@ export function EvidencePanel() {
     patch:   'text-green-400',
     plan:    'text-zinc-400',
     error:   'text-red-400',
+    summary: 'text-fuchsia-400',
   }
 
   const kindLabels: Record<string, string> = {
     turn: 'TURN', command: 'CMD', tool: 'MCP TOOL',
-    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR',
+    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR', summary: 'SUMMARY',
   }
 
   return (
@@ -62,6 +64,8 @@ export function EvidencePanel() {
           <PatchDetail event={rawEvent as PatchApplyEvent} />
         ) : kind === 'plan' ? (
           <PlanDetail event={rawEvent as PlanUpdateEvent} />
+        ) : kind === 'summary' ? (
+          <SummaryDetail event={rawEvent as SummaryNodeEvent} />
         ) : kind === 'turn' ? (
           <TurnDetail event={rawEvent as TurnStartedEvent} />
         ) : (
@@ -213,6 +217,49 @@ function TurnDetail({ event }: { event: TurnStartedEvent }) {
       </Section>
       <Section title="Session ID">
         <span className="text-xs font-mono text-zinc-400">{event.sessionId}</span>
+      </Section>
+    </>
+  )
+}
+
+function SummaryDetail({ event }: { event: SummaryNodeEvent }) {
+  return (
+    <>
+      <Section title="Summary">
+        <CodeBlock className="text-fuchsia-200">{event.summaryText || '(empty)'}</CodeBlock>
+      </Section>
+
+      <Section title="Signal">
+        <span className="inline-flex items-center gap-1 text-xs font-mono bg-fuchsia-900/40 text-fuchsia-200 px-2 py-0.5 rounded border border-fuchsia-700/30">
+          {event.brief.signal}
+        </span>
+      </Section>
+
+      <Section title="Brief">
+        <CodeBlock>
+{JSON.stringify({
+  agentMessage: event.brief.agentMessage,
+  primaryCommand: event.brief.primaryCommand,
+  primaryFilePath: event.brief.primaryFilePath,
+  primaryError: event.brief.primaryError,
+}, null, 2)}
+        </CodeBlock>
+      </Section>
+
+      <Section title="Counts">
+        <CodeBlock>{JSON.stringify(event.counts, null, 2)}</CodeBlock>
+      </Section>
+
+      <Section title="Digest">
+        <CodeBlock>{JSON.stringify(event.digest, null, 2)}</CodeBlock>
+      </Section>
+
+      <Section title="Lineage">
+        <CodeBlock>{JSON.stringify(event.lineage, null, 2)}</CodeBlock>
+      </Section>
+
+      <Section title="Evidence">
+        <CodeBlock>{JSON.stringify(event.evidence, null, 2)}</CodeBlock>
       </Section>
     </>
   )

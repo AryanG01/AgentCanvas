@@ -53,6 +53,116 @@ let defaultRolloutPath = args.find(
 // ---------------------------------------------------------------------------
 
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
+const SUMMARY_DIR = join(homedir(), ".codex", "agentcanvas", "summaries");
+const MAX_SYNTHETIC_SUMMARY_CHARS = 400;
+
+function sanitizePathComponent(value) {
+  return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function normalizeSummaryText(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_SYNTHETIC_SUMMARY_CHARS);
+}
+
+function makeFallbackSummaryNode(threadId, turnId, status, parentTurnId = null, summaryText = "") {
+  const normalized = normalizeSummaryText(summaryText);
+  const brief = normalized || `${status} turn`;
+
+  return {
+    schema_version: "agentcanvas.turn.v2",
+    summary_kind: "agentcanvas_turn_summary",
+    thread_id: threadId,
+    session_id: turnId,
+    forked_from_thread_id: null,
+    nodes: [
+      {
+        node_id: `turn:${turnId}`,
+        parent_id: parentTurnId ? `turn:${parentTurnId}` : null,
+        node_type: "turn",
+        title: `Turn ${turnId}`,
+        summary: brief,
+        status,
+        brief: {
+          signal: status === "interrupted" ? "error" : "status_only",
+          agent_message: brief,
+          primary_command: null,
+          primary_file_path: null,
+          primary_error: status === "interrupted" ? brief : null,
+        },
+        lineage: {
+          parent_turn_id: parentTurnId,
+          forked_from_thread_id: null,
+          started_after_rollback: false,
+        },
+        counts: {
+          commands_total: 0,
+          commands_indexed: 0,
+          commands_omitted: 0,
+          file_paths_total: 0,
+          file_paths_indexed: 0,
+          file_paths_omitted: 0,
+          errors_total: 0,
+          errors_indexed: 0,
+          errors_omitted: 0,
+        },
+        digest: {
+          command_examples: [],
+          file_path_examples: [],
+          error_examples: [],
+        },
+        evidence: {
+          file_paths: [],
+          commands: [],
+          errors: [],
+        },
+      },
+    ],
+  };
+}
+
+function resolveSummaryNode(threadIdValue, turnIdValue, status, parentTurnId, lastAgentMessage, fallbackCache) {
+  const persistedSummary = readTurnSummaryNode(threadIdValue, turnIdValue);
+  if (persistedSummary) {
+    return persistedSummary;
+  }
+
+  if (fallbackCache?.has(turnIdValue)) {
+    return fallbackCache.get(turnIdValue);
+  }
+
+  return makeFallbackSummaryNode(
+    threadIdValue,
+    turnIdValue,
+    status,
+    parentTurnId,
+    lastAgentMessage,
+  );
+}
+
+function readTurnSummaryNode(threadId, turnId) {
+  if (!threadId || !turnId) return null;
+  const summaryPath = join(
+    SUMMARY_DIR,
+    sanitizePathComponent(threadId),
+    `${sanitizePathComponent(turnId)}.json`,
+  );
+  try {
+    const summary = JSON.parse(readFileSync(summaryPath, "utf-8"));
+    if (!Array.isArray(summary?.nodes)) return null;
+    const exactNodeId = `turn:${turnId}`;
+    const node =
+      summary.nodes.find((entry) => entry?.node_id === exactNodeId)
+      ?? summary.nodes.find((entry) => entry?.node_type === "turn")
+      ?? summary.nodes[0];
+    if (!node || typeof node !== "object") return null;
+    return node;
+  } catch {
+    return null;
+  }
+}
 
 function findAllRollouts(dir) {
   const results = [];
@@ -172,10 +282,14 @@ function buildReplayMessages(rolloutLines) {
   let threadId = null;
   let currentTurnId = null;
   let turnCounter = 0;
+  const completedTurnIds = [];
   const hasTaskStarted = rolloutLines.some(
     (l) => l.type === "event_msg" && l.payload?.type === "task_started",
   );
   const pendingCalls = new Map();
+  const summaryFallbackByTurn = new Map();
+  const turnParentMap = new Map();
+  const turnCompletionCache = new Map();
 
   function ensureTurnOpen(ts) {
     if (!currentTurnId) {
@@ -241,6 +355,7 @@ function buildReplayMessages(rolloutLines) {
       const sub = p.type;
 
       if (sub === "task_started") {
+        if (currentTurnId) turnParentMap.set(p.turn_id, currentTurnId);
         currentTurnId = p.turn_id;
         messages.push({
           ts,
@@ -276,6 +391,31 @@ function buildReplayMessages(rolloutLines) {
       }
 
       if (sub === "task_complete") {
+        const completedTurnId = p.turn_id || currentTurnId || "";
+        const summaryText = p.last_agent_message ?? "";
+        const parentTurnId = turnParentMap.get(completedTurnId) ?? null;
+        const summaryNode = resolveSummaryNode(
+          threadId,
+          completedTurnId,
+          "completed",
+          parentTurnId,
+          summaryText,
+          summaryFallbackByTurn,
+        );
+        summaryFallbackByTurn.set(completedTurnId, summaryNode);
+        if (summaryNode) {
+          messages.push({
+            ts,
+            msg: {
+              method: "agentcanvas/summaryNode",
+              params: {
+                threadId: threadId || "",
+                turnId: completedTurnId,
+                node: summaryNode,
+              },
+            },
+          });
+        }
         messages.push({
           ts,
           msg: {
@@ -283,7 +423,7 @@ function buildReplayMessages(rolloutLines) {
             params: {
               threadId: threadId || "",
               turn: {
-                id: p.turn_id || currentTurnId || "",
+                id: completedTurnId,
                 items: [],
                 status: "completed",
                 error: null,
@@ -291,11 +431,37 @@ function buildReplayMessages(rolloutLines) {
             },
           },
         });
+        if (completedTurnId) completedTurnIds.push(completedTurnId);
         currentTurnId = null;
         continue;
       }
 
       if (sub === "turn_aborted") {
+        const completedTurnId = p.turn_id || currentTurnId || "";
+        const summaryText = p.last_agent_message ?? "";
+        const parentTurnId = turnParentMap.get(completedTurnId) ?? null;
+        const summaryNode = resolveSummaryNode(
+          threadId,
+          completedTurnId,
+          "interrupted",
+          parentTurnId,
+          summaryText,
+          summaryFallbackByTurn,
+        );
+        summaryFallbackByTurn.set(completedTurnId, summaryNode);
+        if (summaryNode) {
+          messages.push({
+            ts,
+            msg: {
+              method: "agentcanvas/summaryNode",
+              params: {
+                threadId: threadId || "",
+                turnId: completedTurnId,
+                node: summaryNode,
+              },
+            },
+          });
+        }
         messages.push({
           ts,
           msg: {
@@ -303,7 +469,7 @@ function buildReplayMessages(rolloutLines) {
             params: {
               threadId: threadId || "",
               turn: {
-                id: p.turn_id || currentTurnId || "",
+                id: completedTurnId,
                 items: [],
                 status: "interrupted",
                 error: null,
@@ -311,7 +477,42 @@ function buildReplayMessages(rolloutLines) {
             },
           },
         });
+        if (completedTurnId) completedTurnIds.push(completedTurnId);
         currentTurnId = null;
+        continue;
+      }
+
+      if (sub === "thread_rolled_back") {
+        const numTurns = Number(p.num_turns ?? p.numTurns ?? 0);
+        if (numTurns > 0) {
+          const start = Math.max(0, completedTurnIds.length - numTurns);
+          const rolledBackTurnIds = completedTurnIds.splice(start, numTurns);
+          for (const rolledBackTurnId of rolledBackTurnIds) {
+            const summaryNode = turnCompletionCache.get(rolledBackTurnId)
+              ?? readTurnSummaryNode(threadId, rolledBackTurnId)
+              ?? summaryFallbackByTurn.get(rolledBackTurnId)
+              ?? makeFallbackSummaryNode(
+                threadId,
+                rolledBackTurnId,
+                "rolled_back",
+                turnParentMap.get(rolledBackTurnId) ?? null,
+                "",
+              );
+            if (summaryNode) turnCompletionCache.set(rolledBackTurnId, summaryNode);
+            if (!summaryNode) continue;
+            messages.push({
+              ts,
+              msg: {
+                method: "agentcanvas/summaryNode",
+                params: {
+                  threadId: threadId || "",
+                  turnId: rolledBackTurnId,
+                  node: summaryNode,
+                },
+              },
+            });
+          }
+        }
         continue;
       }
 
@@ -630,7 +831,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-server.listen(PORT, () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`\nReplay server running on http://localhost:${PORT}`);
   console.log(`  GET /api/sessions — list available sessions`);
   console.log(`  WS  ws://localhost:${PORT}[?file=<path>] — replay a session`);

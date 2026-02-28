@@ -1259,18 +1259,26 @@ fn collect_node_evidence(
 fn is_file_path_key(key: &str) -> bool {
     matches!(
         key,
-        "file" | "files" | "file_path" | "file_paths" | "filepath" | "filepaths" | "path" | "paths"
+        "file"
+            | "files"
+            | "file_path"
+            | "file_paths"
+            | "filepath"
+            | "filepaths"
+            | "path"
+            | "paths"
+            | "primary_file_path"
     )
 }
 
 fn is_command_key(key: &str) -> bool {
-    matches!(key, "command" | "commands" | "cmd")
+    matches!(key, "command" | "commands" | "cmd" | "primary_command")
 }
 
 fn is_error_key(key: &str) -> bool {
     matches!(
         key,
-        "error" | "errors" | "error_text" | "errortext" | "last_error" | "stderr"
+        "error" | "errors" | "error_text" | "errortext" | "last_error" | "stderr" | "primary_error"
     )
 }
 
@@ -1371,16 +1379,21 @@ fn is_semantic_text_key(key: &str) -> bool {
             | "command"
             | "commands"
             | "cmd"
+            | "primary_command"
             | "error"
             | "errors"
             | "error_text"
             | "last_error"
+            | "primary_error"
             | "file"
             | "files"
             | "file_path"
             | "file_paths"
+            | "primary_file_path"
             | "path"
             | "paths"
+            | "agent_message"
+            | "signal"
     )
 }
 
@@ -1763,6 +1776,74 @@ mod tests {
             error_matches[0].matched_error_text,
             Some("build failed".to_string())
         );
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn summary_search_indexes_primary_brief_fields() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+
+        let summary = json!({
+            "schema_version": "agentcanvas.turn.v2",
+            "summary_kind": "agentcanvas_turn_summary",
+            "thread_id": "thread-brief",
+            "session_id": "session-brief",
+            "nodes": [
+                {
+                    "node_id": "turn:brief-1",
+                    "node_type": "turn",
+                    "title": "Turn brief-1",
+                    "brief": {
+                        "signal": "error",
+                        "agent_message": "build failed while running tests",
+                        "primary_command": "cargo test -p codex-core",
+                        "primary_file_path": "/repo/codex-rs/core/src/rollout/recorder.rs",
+                        "primary_error": "assertion failed"
+                    },
+                    "evidence": {
+                        "commands": [],
+                        "file_paths": [],
+                        "errors": []
+                    }
+                }
+            ]
+        });
+        runtime
+            .upsert_session_summary(&SessionSummaryPersistParams {
+                summary_id: None,
+                thread_id: "thread-brief".to_string(),
+                session_id: "session-brief".to_string(),
+                schema_version: "agentcanvas.turn.v2".to_string(),
+                root_node_id: None,
+                summary,
+            })
+            .await
+            .expect("upsert summary");
+
+        let file_matches = runtime
+            .search_summary_nodes_by_file_path("recorder.rs", 10)
+            .await
+            .expect("search by file path");
+        assert_eq!(file_matches.len(), 1);
+        assert_eq!(file_matches[0].node_id, "turn:brief-1");
+
+        let command_matches = runtime
+            .search_summary_nodes_by_command_substring("cargo test -p codex-core", 10)
+            .await
+            .expect("search by command");
+        assert_eq!(command_matches.len(), 1);
+        assert_eq!(command_matches[0].node_id, "turn:brief-1");
+
+        let error_matches = runtime
+            .search_summary_nodes_by_error_text("assertion failed", 10)
+            .await
+            .expect("search by error");
+        assert_eq!(error_matches.len(), 1);
+        assert_eq!(error_matches[0].node_id, "turn:brief-1");
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

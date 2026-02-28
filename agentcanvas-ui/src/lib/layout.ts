@@ -2,7 +2,6 @@ import type { Node, Edge } from '@xyflow/react'
 import type { GraphNodeData } from './types'
 
 // Node dimensions
-const SESSION_W = 260
 const SESSION_H = 56
 const TURN_W = 240
 const TURN_H = 90    // taller to show prompt
@@ -32,8 +31,9 @@ const ITEMS_PER_COL = 4
  */
 export function applyConversationLayout(
   nodes: Node<GraphNodeData>[],
-  _edges: Edge[]
+  edges: Edge[]
 ): Node<GraphNodeData>[] {
+  void edges
   const sessionNode = nodes.find(n => n.data.kind === 'session')
   const turnNodes = nodes.filter(n => n.data.kind === 'turn')
   const itemNodes = nodes.filter(n => n.data.kind !== 'session' && n.data.kind !== 'turn')

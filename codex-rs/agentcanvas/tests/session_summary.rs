@@ -1,5 +1,6 @@
 #![allow(clippy::panic)]
 
+use codex_agentcanvas::AppEvent;
 use codex_agentcanvas::CollabAgentState;
 use codex_agentcanvas::CollabAgentStatus;
 use codex_agentcanvas::CollabStatus;
@@ -20,7 +21,7 @@ use codex_agentcanvas::TodoItem;
 use codex_agentcanvas::TodoListDetails;
 use codex_agentcanvas::TurnFailedPayload;
 use codex_agentcanvas::TurnStartedPayload;
-use codex_agentcanvas::{translate_to_app_event, AppEvent};
+use codex_agentcanvas::translate_to_app_event;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 

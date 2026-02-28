@@ -76,14 +76,15 @@ export function GraphCanvas() {
     }
   })
 
-  const onNodeClick: NodeMouseHandler<Node<GraphNodeData>> = useCallback(
+  const onNodeClick: NodeMouseHandler = useCallback(
     (_evt, node) => {
+      const graphNode = node as Node<GraphNodeData>
       // Turn nodes: toggle expand/collapse
-      if (node.data.kind === 'turn') {
-        toggleTurn(node.data.turnId)
+      if (graphNode.data.kind === 'turn') {
+        toggleTurn(graphNode.data.turnId)
         return
       }
-      selectNode(node.id === selectedId ? null : node.id)
+      selectNode(graphNode.id === selectedId ? null : graphNode.id)
     },
     [selectedId, selectNode, toggleTurn]
   )
@@ -121,6 +122,7 @@ export function GraphCanvas() {
             if (kind === 'tool') return '#3b82f6'
             if (kind === 'patch') return '#22c55e'
             if (kind === 'plan') return '#a1a1aa'
+            if (kind === 'summary') return '#d946ef'
             return '#eab308'
           }}
         />

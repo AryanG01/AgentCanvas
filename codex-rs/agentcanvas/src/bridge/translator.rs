@@ -1,6 +1,10 @@
 //! Translates `NormalizedEvent` streams into `AppEvent` types for the UI.
 
-use crate::schema::{EventPayload, ItemDetails, McpStatus, NormalizedEvent, PatchStatus};
+use crate::schema::EventPayload;
+use crate::schema::ItemDetails;
+use crate::schema::McpStatus;
+use crate::schema::NormalizedEvent;
+use crate::schema::PatchStatus;
 
 use super::app_event::AppEvent;
 

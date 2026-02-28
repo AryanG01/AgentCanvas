@@ -1,6 +1,8 @@
 import { memo } from 'react'
-import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
 import type { GraphNodeData } from '../lib/types'
+
+type GraphNode = Node<GraphNodeData>
 
 const statusConfig: Record<string, { dot: string; ring: string; label: string }> = {
   running:   { dot: 'bg-yellow-400 animate-pulse', ring: 'border-yellow-500/40',  label: 'In Progress' },
@@ -9,7 +11,7 @@ const statusConfig: Record<string, { dot: string; ring: string; label: string }>
   cancelled: { dot: 'bg-zinc-400',                 ring: 'border-zinc-500/40',    label: 'Cancelled' },
 }
 
-export const TurnNode = memo(({ data, selected }: NodeProps<GraphNodeData>) => {
+export const TurnNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
   const cfg = statusConfig[data.status ?? 'running']
   return (
     <div

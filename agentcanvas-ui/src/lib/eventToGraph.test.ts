@@ -38,6 +38,49 @@ const errorCmd: AppEvent = {
   ts: 1002,
 }
 
+const summaryNode: AppEvent = {
+  type: 'SummaryNode',
+  id: 'turn:t1',
+  turnId: 't1',
+  status: 'completed',
+  summaryText: 'status=completed; signal=execution; command=cargo test -p codex-core',
+  brief: {
+    signal: 'execution',
+    agentMessage: null,
+    primaryCommand: 'cargo test -p codex-core',
+    primaryFilePath: null,
+    primaryError: null,
+  },
+  counts: {
+    commandsTotal: 1,
+    commandsIndexed: 1,
+    commandsOmitted: 0,
+    filePathsTotal: 0,
+    filePathsIndexed: 0,
+    filePathsOmitted: 0,
+    errorsTotal: 0,
+    errorsIndexed: 0,
+    errorsOmitted: 0,
+  },
+  digest: {
+    commandExamples: ['cargo test -p codex-core'],
+    filePathExamples: [],
+    errorExamples: [],
+  },
+  lineage: {
+    parentTurnId: null,
+    forkedFromThreadId: null,
+    startedAfterRollback: false,
+    wasRolledBack: false,
+  },
+  evidence: {
+    filePaths: [],
+    commands: [{ command: 'cargo test -p codex-core', exitCode: 0 }],
+    errors: [],
+  },
+  ts: 1003,
+}
+
 describe('buildGraph', () => {
   it('creates a session node from ThreadStarted', () => {
     const { nodes } = buildGraph([threadStarted])
@@ -60,7 +103,7 @@ describe('buildGraph', () => {
     expect(cmdNode).toBeDefined()
     // session→turn flow edge + turn→cmd detail edge
     expect(edges).toHaveLength(2)
-    const detailEdge = edges.find(e => e.target === 'event-e1')
+    const detailEdge = edges.find(e => e.target === 'cmds-t1')
     expect(detailEdge?.source).toBe('turn-t1')
   })
 
@@ -68,6 +111,15 @@ describe('buildGraph', () => {
     const { nodes } = buildGraph([threadStarted, turnStarted, errorCmd])
     const errNode = nodes.find(n => n.id === 'event-e2')
     expect(errNode?.data.kind).toBe('error')
+  })
+
+  it('adds a summary child node when SummaryNode event is present', () => {
+    const { nodes, edges } = buildGraph([threadStarted, turnStarted, summaryNode])
+    const summary = nodes.find(n => n.id === 'summary-t1')
+    expect(summary).toBeDefined()
+    expect(summary?.data.kind).toBe('summary')
+    const detailEdge = edges.find(e => e.target === 'summary-t1')
+    expect(detailEdge?.source).toBe('turn-t1')
   })
 
   it('returns no nodes for empty events', () => {
