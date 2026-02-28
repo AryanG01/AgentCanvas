@@ -133,13 +133,16 @@ function resolveSummaryNode(threadIdValue, turnIdValue, status, parentTurnId, la
     return fallbackCache.get(turnIdValue);
   }
 
-  return makeFallbackSummaryNode(
+  const fallback = makeFallbackSummaryNode(
     threadIdValue,
     turnIdValue,
     status,
     parentTurnId,
     lastAgentMessage,
   );
+  // makeFallbackSummaryNode returns the full envelope {schema_version, nodes: [...]},
+  // but the UI expects the inner node object {node_id, summary, brief, ...}
+  return fallback?.nodes?.[0] ?? fallback;
 }
 
 function readTurnSummaryNode(threadId, turnId) {
@@ -488,16 +491,17 @@ function buildReplayMessages(rolloutLines) {
           const start = Math.max(0, completedTurnIds.length - numTurns);
           const rolledBackTurnIds = completedTurnIds.splice(start, numTurns);
           for (const rolledBackTurnId of rolledBackTurnIds) {
-            const summaryNode = turnCompletionCache.get(rolledBackTurnId)
-              ?? readTurnSummaryNode(threadId, rolledBackTurnId)
-              ?? summaryFallbackByTurn.get(rolledBackTurnId)
-              ?? makeFallbackSummaryNode(
+            const rollbackFallbackEnvelope = makeFallbackSummaryNode(
                 threadId,
                 rolledBackTurnId,
                 "rolled_back",
                 turnParentMap.get(rolledBackTurnId) ?? null,
                 "",
               );
+            const summaryNode = turnCompletionCache.get(rolledBackTurnId)
+              ?? readTurnSummaryNode(threadId, rolledBackTurnId)
+              ?? summaryFallbackByTurn.get(rolledBackTurnId)
+              ?? rollbackFallbackEnvelope?.nodes?.[0] ?? rollbackFallbackEnvelope;
             if (summaryNode) turnCompletionCache.set(rolledBackTurnId, summaryNode);
             if (!summaryNode) continue;
             messages.push({
