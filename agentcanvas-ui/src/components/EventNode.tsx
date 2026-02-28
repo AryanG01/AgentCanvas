@@ -1,6 +1,8 @@
 import { memo } from 'react'
-import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
 import type { GraphNodeData, NodeKind } from '../lib/types'
+
+type GraphNode = Node<GraphNodeData>
 
 interface KindConfig {
   icon: string
@@ -39,6 +41,13 @@ const kindConfig: Record<NodeKind, KindConfig> = {
     border: 'border-zinc-600/30',
     iconBg: 'bg-zinc-700/50 text-zinc-300',
   },
+  summary: {
+    icon: 'S',
+    badge: 'bg-fuchsia-900/60 text-fuchsia-300 border border-fuchsia-700/40',
+    badgeText: 'SUMMARY',
+    border: 'border-fuchsia-700/40',
+    iconBg: 'bg-fuchsia-900/50 text-fuchsia-300',
+  },
   error: {
     icon: '✕',
     badge: 'bg-red-900/60 text-red-300 border border-red-700/40',
@@ -53,9 +62,16 @@ const kindConfig: Record<NodeKind, KindConfig> = {
     border: 'border-indigo-700/30',
     iconBg: 'bg-indigo-900/50 text-indigo-300',
   },
+  session: {
+    icon: '◉',
+    badge: 'bg-indigo-900/60 text-indigo-300 border border-indigo-700/40',
+    badgeText: 'SESSION',
+    border: 'border-indigo-700/30',
+    iconBg: 'bg-indigo-900/50 text-indigo-300',
+  },
 }
 
-export const EventNode = memo(({ data, selected }: NodeProps<GraphNodeData>) => {
+export const EventNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
   const cfg = kindConfig[data.kind]
   return (
     <div

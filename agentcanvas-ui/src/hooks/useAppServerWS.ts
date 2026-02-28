@@ -64,6 +64,11 @@ function normalizeItem(item: Record<string, unknown>, turnId: string): AppEvent 
   }
 }
 
+function toNumber(value: unknown): number {
+  const num = Number(value)
+  return Number.isFinite(num) ? num : 0
+}
+
 export function useAppServerWS(overrideUrl?: string) {
   const addEvent = useGraphStore(s => s.addEvent)
   const setWsStatus = useGraphStore(s => s.setWsStatus)
@@ -131,6 +136,78 @@ export function useAppServerWS(overrideUrl?: string) {
               : turn.status === 'failed' ? 'error'
               : 'cancelled'
             addEvent({ type: 'TurnComplete', turnId: turn.id, status, ts: Date.now() })
+
+          } else if (method === 'agentcanvas/summaryNode') {
+            const turnId = (params.turnId as string) ?? ''
+            const node = (params.node as Record<string, unknown>) ?? {}
+            const brief = (node.brief as Record<string, unknown>) ?? {}
+            const counts = (node.counts as Record<string, unknown>) ?? {}
+            const digest = (node.digest as Record<string, unknown>) ?? {}
+            const lineage = (node.lineage as Record<string, unknown>) ?? {}
+            const evidence = (node.evidence as Record<string, unknown>) ?? {}
+            const commands = Array.isArray(evidence.commands) ? evidence.commands : []
+
+            addEvent({
+              type: 'SummaryNode',
+              id: (node.node_id as string) ?? `summary-${turnId}`,
+              turnId,
+              status: (node.status as string) ?? 'unknown',
+              summaryText: (node.summary as string) ?? '',
+              brief: {
+                signal: (brief.signal as string) ?? 'status_only',
+                agentMessage: (brief.agent_message as string) ?? null,
+                primaryCommand: (brief.primary_command as string) ?? null,
+                primaryFilePath: (brief.primary_file_path as string) ?? null,
+                primaryError: (brief.primary_error as string) ?? null,
+              },
+              counts: {
+                commandsTotal: toNumber(counts.commands_total),
+                commandsIndexed: toNumber(counts.commands_indexed),
+                commandsOmitted: toNumber(counts.commands_omitted),
+                filePathsTotal: toNumber(counts.file_paths_total),
+                filePathsIndexed: toNumber(counts.file_paths_indexed),
+                filePathsOmitted: toNumber(counts.file_paths_omitted),
+                errorsTotal: toNumber(counts.errors_total),
+                errorsIndexed: toNumber(counts.errors_indexed),
+                errorsOmitted: toNumber(counts.errors_omitted),
+              },
+              digest: {
+                commandExamples: Array.isArray(digest.command_examples)
+                  ? digest.command_examples.filter((value): value is string => typeof value === 'string')
+                  : [],
+                filePathExamples: Array.isArray(digest.file_path_examples)
+                  ? digest.file_path_examples.filter((value): value is string => typeof value === 'string')
+                  : [],
+                errorExamples: Array.isArray(digest.error_examples)
+                  ? digest.error_examples.filter((value): value is string => typeof value === 'string')
+                  : [],
+              },
+              lineage: {
+                parentTurnId: (lineage.parent_turn_id as string) ?? null,
+                forkedFromThreadId: (lineage.forked_from_thread_id as string) ?? null,
+                startedAfterRollback: Boolean(lineage.started_after_rollback),
+                wasRolledBack: Boolean(lineage.was_rolled_back),
+              },
+              evidence: {
+                filePaths: Array.isArray(evidence.file_paths)
+                  ? evidence.file_paths.filter((value): value is string => typeof value === 'string')
+                  : [],
+                commands: commands
+                  .map((entry) => {
+                    if (!entry || typeof entry !== 'object') return null
+                    const item = entry as Record<string, unknown>
+                    return {
+                      command: (item.command as string) ?? '',
+                      exitCode: item.exit_code == null ? null : toNumber(item.exit_code),
+                    }
+                  })
+                  .filter((entry): entry is { command: string; exitCode: number | null } => entry !== null),
+                errors: Array.isArray(evidence.errors)
+                  ? evidence.errors.filter((value): value is string => typeof value === 'string')
+                  : [],
+              },
+              ts: Date.now(),
+            })
 
           } else if (method === 'item/completed') {
             const item = params.item as Record<string, unknown>

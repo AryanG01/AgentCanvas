@@ -19,6 +19,9 @@
 import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import { spawn } from 'child_process'
+import { readFileSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
 import * as readline from 'readline'
 
 // ── Parse CLI args ────────────────────────────────────────────────────────────
@@ -26,6 +29,32 @@ const args = process.argv.slice(2)
 const portArg = args[args.indexOf('--port') + 1]
 const threadIdArg = args[args.indexOf('--thread-id') + 1]
 const PORT = portArg ? parseInt(portArg) : 8080
+const SUMMARY_DIR = join(homedir(), '.codex', 'agentcanvas', 'summaries')
+
+function sanitizePathComponent(value) {
+  return String(value).replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+function readTurnSummaryNode(threadIdValue, turnIdValue) {
+  if (!threadIdValue || !turnIdValue) return null
+  const summaryPath = join(
+    SUMMARY_DIR,
+    sanitizePathComponent(threadIdValue),
+    `${sanitizePathComponent(turnIdValue)}.json`,
+  )
+  try {
+    const summary = JSON.parse(readFileSync(summaryPath, 'utf-8'))
+    if (!Array.isArray(summary?.nodes)) return null
+    const exactNodeId = `turn:${turnIdValue}`
+    return (
+      summary.nodes.find((entry) => entry?.node_id === exactNodeId)
+      ?? summary.nodes.find((entry) => entry?.node_type === 'turn')
+      ?? null
+    )
+  } catch {
+    return null
+  }
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let nextId = 1
@@ -84,6 +113,21 @@ rl.on('line', (line) => {
   // Track turn/started
   if (msg.method === 'turn/started') {
     turnId = msg.params?.turn?.id ?? null
+  }
+
+  if (msg.method === 'turn/completed') {
+    const completedTurnId = msg.params?.turn?.id ?? turnId
+    const summaryNode = readTurnSummaryNode(threadId, completedTurnId)
+    if (summaryNode) {
+      broadcast({
+        method: 'agentcanvas/summaryNode',
+        params: {
+          threadId: threadId ?? '',
+          turnId: completedTurnId ?? '',
+          node: summaryNode,
+        },
+      })
+    }
   }
 
   // Handle initialize response → auto-send initialized + thread/start

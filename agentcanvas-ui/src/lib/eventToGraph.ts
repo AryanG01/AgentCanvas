@@ -1,5 +1,5 @@
 import type { Node, Edge } from '@xyflow/react'
-import type { AppEvent, CommandExecutionEvent, GraphNodeData, NodeKind } from './types'
+import type { AppEvent, CommandExecutionEvent, GraphNodeData } from './types'
 
 type GraphNode = Node<GraphNodeData>
 
@@ -90,6 +90,55 @@ export function buildGraph(events: AppEvent[]): GraphResult {
     } else if (event.type === 'TurnComplete') {
       const node = nodes.find(n => n.id === `turn-${event.turnId}`)
       if (node) node.data = { ...node.data, status: event.status }
+    } else if (event.type === 'SummaryNode') {
+      const turnNode = nodes.find(n => n.id === `turn-${event.turnId}`)
+      if (turnNode) {
+        if (turnNode.data.label === '(typing…)' && event.summaryText.trim()) {
+          turnNode.data = { ...turnNode.data, label: event.summaryText }
+        }
+        if (event.status === 'rolled_back') {
+          turnNode.data = { ...turnNode.data, status: 'cancelled' }
+        }
+      }
+
+      const summaryNodeId = `summary-${event.turnId}`
+      const summaryLabel = event.brief.agentMessage?.trim()
+        || event.summaryText.trim()
+        || `${event.brief.signal} summary`
+      const summaryStatus =
+        event.status === 'rolled_back'
+          ? 'cancelled'
+          : event.status === 'failed' || event.brief.signal === 'error'
+            ? 'error'
+            : 'success'
+      const existingSummaryNode = nodes.find(n => n.id === summaryNodeId)
+      if (existingSummaryNode) {
+        existingSummaryNode.data = {
+          ...existingSummaryNode.data,
+          label: summaryLabel,
+          status: summaryStatus,
+          rawEvent: event,
+        }
+      } else {
+        nodes.push({
+          id: summaryNodeId,
+          type: 'eventNode',
+          position: { x: 0, y: 0 },
+          data: {
+            kind: 'summary',
+            label: summaryLabel,
+            status: summaryStatus,
+            turnId: event.turnId,
+            rawEvent: event,
+          },
+        })
+        edges.push({
+          id: `detail-${summaryNodeId}`,
+          source: `turn-${event.turnId}`,
+          target: summaryNodeId,
+          data: { kind: 'detail' },
+        })
+      }
     } else if (event.type === 'CommandExecution') {
       // Failed commands → individual error nodes
       if (failedCmds.has(event.id)) {

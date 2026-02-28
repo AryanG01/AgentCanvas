@@ -73,6 +73,49 @@ export interface PlanUpdateEvent {
   ts: number
 }
 
+export interface SummaryNodeEvent {
+  type: 'SummaryNode'
+  id: string
+  turnId: string
+  status: string
+  summaryText: string
+  brief: {
+    signal: string
+    agentMessage: string | null
+    primaryCommand: string | null
+    primaryFilePath: string | null
+    primaryError: string | null
+  }
+  counts: {
+    commandsTotal: number
+    commandsIndexed: number
+    commandsOmitted: number
+    filePathsTotal: number
+    filePathsIndexed: number
+    filePathsOmitted: number
+    errorsTotal: number
+    errorsIndexed: number
+    errorsOmitted: number
+  }
+  digest: {
+    commandExamples: string[]
+    filePathExamples: string[]
+    errorExamples: string[]
+  }
+  lineage: {
+    parentTurnId: string | null
+    forkedFromThreadId: string | null
+    startedAfterRollback: boolean
+    wasRolledBack: boolean
+  }
+  evidence: {
+    filePaths: string[]
+    commands: Array<{ command: string; exitCode: number | null }>
+    errors: string[]
+  }
+  ts: number
+}
+
 /** Internal synthetic event — updates a turn node's label from the userMessage item */
 export interface UserPromptPatchEvent {
   type: 'UserPromptPatch'
@@ -89,15 +132,16 @@ export type AppEvent =
   | McpToolCallEvent
   | PatchApplyEvent
   | PlanUpdateEvent
+  | SummaryNodeEvent
   | UserPromptPatchEvent
 
 // ---------------------------------------------------------------------------
 // Graph node types
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error'
+export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error' | 'summary'
 
-export interface GraphNodeData {
+export interface GraphNodeData extends Record<string, unknown> {
   kind: NodeKind
   label: string
   status?: string
