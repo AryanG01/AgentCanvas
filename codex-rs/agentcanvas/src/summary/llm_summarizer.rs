@@ -121,7 +121,10 @@ pub(crate) async fn generate_turn_summaries(
     let _ = dotenvy::dotenv();
 
     // Fail fast when there is no API key.
-    if std::env::var("OPENAI_API_KEY").unwrap_or_default().is_empty() {
+    if std::env::var("OPENAI_API_KEY")
+        .unwrap_or_default()
+        .is_empty()
+    {
         return Err(LlmSummaryError::MissingApiKey);
     }
 
@@ -135,9 +138,7 @@ pub(crate) async fn generate_turn_summaries(
         .temperature(config.temperature)
         .messages(vec![
             ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: ChatCompletionRequestSystemMessageContent::Text(
-                    SYSTEM_PROMPT.to_string(),
-                ),
+                content: ChatCompletionRequestSystemMessageContent::Text(SYSTEM_PROMPT.to_string()),
                 name: None,
             }),
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -183,11 +184,7 @@ pub(crate) fn extract_turn_evidence(
             status: acc.status.clone(),
             last_agent_message: acc.last_agent_message.clone(),
             plan_updates: acc.plan_updates.clone(),
-            commands: acc
-                .commands
-                .iter()
-                .map(|c| c.command.clone())
-                .collect(),
+            commands: acc.commands.iter().map(|c| c.command.clone()).collect(),
             file_paths: btree_to_vec(&acc.file_paths),
             external_tools: btree_to_vec(&acc.external_tools),
             errors: btree_to_vec(&acc.errors),

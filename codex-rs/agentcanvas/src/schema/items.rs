@@ -1,6 +1,7 @@
 //! Item types and detail structures
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashMap;
 use ts_rs::TS;
 

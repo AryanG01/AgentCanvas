@@ -137,6 +137,16 @@ impl RolloutRecorderParams {
 }
 
 const PERSISTED_EXEC_AGGREGATED_OUTPUT_MAX_BYTES: usize = 10_000;
+const AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION: &str = "agentcanvas.turn.v2";
+const AGENTCANVAS_TURN_SUMMARY_KIND: &str = "agentcanvas_turn_summary";
+const SUMMARY_MAX_AGENT_MESSAGE_BYTES: usize = 480;
+const SUMMARY_MAX_COMMAND_TEXT_BYTES: usize = 320;
+const SUMMARY_MAX_FILE_PATH_TEXT_BYTES: usize = 280;
+const SUMMARY_MAX_ERROR_TEXT_BYTES: usize = 420;
+const SUMMARY_MAX_COMMAND_ITEMS: usize = 30;
+const SUMMARY_MAX_FILE_PATH_ITEMS: usize = 40;
+const SUMMARY_MAX_ERROR_ITEMS: usize = 20;
+const SUMMARY_DIGEST_ITEMS: usize = 5;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
 struct AgentCanvasCommandEvidence {
@@ -517,6 +527,132 @@ fn extract_command_from_json(input: &str) -> Option<String> {
     None
 }
 
+fn normalize_summary_text(value: &str, max_bytes: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_text(trimmed, TruncationPolicy::Bytes(max_bytes)))
+}
+
+fn classify_turn_signal(
+    total_command_count: usize,
+    total_file_path_count: usize,
+    total_error_count: usize,
+) -> &'static str {
+    if total_error_count > 0 {
+        return "error";
+    }
+    if total_file_path_count > 0 {
+        return "code_changes";
+    }
+    if total_command_count > 0 {
+        return "execution";
+    }
+    "status_only"
+}
+
+fn build_compact_turn_summary(
+    status: &str,
+    signal: &str,
+    parent_turn_id: Option<&str>,
+    child_turn_id: Option<&str>,
+    agent_message: Option<&str>,
+    command_digest: &[String],
+    file_path_digest: &[String],
+    error_digest: &[String],
+    total_command_count: usize,
+    total_file_path_count: usize,
+    total_error_count: usize,
+) -> String {
+    let mut parts = vec![format!("status={status}"), format!("signal={signal}")];
+    if total_command_count > 0 {
+        parts.push(format!("commands_total={total_command_count}"));
+    }
+    if total_file_path_count > 0 {
+        parts.push(format!("file_paths_total={total_file_path_count}"));
+    }
+    if total_error_count > 0 {
+        parts.push(format!("errors_total={total_error_count}"));
+    }
+    if let Some(parent_turn_id) = parent_turn_id {
+        parts.push(format!("parent_turn={parent_turn_id}"));
+    }
+    if let Some(child_turn_id) = child_turn_id {
+        parts.push(format!("child_turn={child_turn_id}"));
+    }
+    if let Some(command) = command_digest.first() {
+        parts.push(format!("primary_command={command}"));
+    }
+    if let Some(file_path) = file_path_digest.first() {
+        parts.push(format!("primary_file_path={file_path}"));
+    }
+    if let Some(error) = error_digest.first() {
+        parts.push(format!("primary_error={error}"));
+    }
+    if let Some(agent_message) = agent_message {
+        parts.push(format!("agent_message={agent_message}"));
+    }
+    truncate_text(
+        parts.join("; ").as_str(),
+        TruncationPolicy::Bytes(SUMMARY_MAX_AGENT_MESSAGE_BYTES),
+    )
+}
+
+fn compact_command_evidence(
+    commands: Vec<AgentCanvasCommandEvidence>,
+) -> (Vec<AgentCanvasCommandEvidence>, usize, usize) {
+    let mut normalized_commands = BTreeSet::new();
+    for command in commands {
+        let Some(command_text) =
+            normalize_summary_text(command.command.as_str(), SUMMARY_MAX_COMMAND_TEXT_BYTES)
+        else {
+            continue;
+        };
+        normalized_commands.insert(AgentCanvasCommandEvidence {
+            command: command_text,
+            exit_code: command.exit_code,
+        });
+    }
+    let total_commands = normalized_commands.len();
+    let kept_commands: Vec<AgentCanvasCommandEvidence> = normalized_commands
+        .into_iter()
+        .take(SUMMARY_MAX_COMMAND_ITEMS)
+        .collect();
+    let omitted_commands = total_commands.saturating_sub(kept_commands.len());
+    (kept_commands, total_commands, omitted_commands)
+}
+
+fn compact_string_evidence(
+    values: Vec<String>,
+    max_items: usize,
+    max_text_bytes: usize,
+) -> (Vec<String>, usize, usize) {
+    let mut normalized_values = BTreeSet::new();
+    for value in values {
+        if let Some(normalized) = normalize_summary_text(value.as_str(), max_text_bytes) {
+            normalized_values.insert(normalized);
+        }
+    }
+    let total_values = normalized_values.len();
+    let kept_values: Vec<String> = normalized_values.into_iter().take(max_items).collect();
+    let omitted_values = total_values.saturating_sub(kept_values.len());
+    (kept_values, total_values, omitted_values)
+}
+
+fn build_digest_strings(values: &[String]) -> Vec<String> {
+    values.iter().take(SUMMARY_DIGEST_ITEMS).cloned().collect()
+}
+
+fn build_digest_commands(commands: &[AgentCanvasCommandEvidence]) -> Vec<String> {
+    commands
+        .iter()
+        .take(SUMMARY_DIGEST_ITEMS)
+        .map(|command| command.command.clone())
+        .collect()
+}
+
 async fn persist_agentcanvas_turn_summaries(
     state_db_ctx: Option<&StateRuntime>,
     accumulator: &AgentCanvasSummaryAccumulator,
@@ -527,7 +663,11 @@ async fn persist_agentcanvas_turn_summaries(
         return;
     };
 
-    for turn_summary in summary_updates.completed_turn_summaries {
+    let completed_turn_summaries = summary_updates.completed_turn_summaries;
+    let completed_turn_count = completed_turn_summaries.len();
+
+    for (index, turn_summary) in completed_turn_summaries.iter().enumerate() {
+        let turn_summary = turn_summary.clone();
         let CompletedAgentCanvasTurnSummary {
             turn_id,
             status,
@@ -543,24 +683,86 @@ async fn persist_agentcanvas_turn_summaries(
         let parent_node_id = parent_turn_id
             .as_ref()
             .map(|parent_turn_id| format!("turn:{parent_turn_id}"));
+        let child_turn_id = (index + 1 < completed_turn_count)
+            .then(|| completed_turn_summaries[index + 1].turn_id.as_str());
+        let (commands, total_command_count, omitted_command_count) =
+            compact_command_evidence(commands);
+        let (file_paths, total_file_path_count, omitted_file_path_count) = compact_string_evidence(
+            file_paths,
+            SUMMARY_MAX_FILE_PATH_ITEMS,
+            SUMMARY_MAX_FILE_PATH_TEXT_BYTES,
+        );
+        let (errors, total_error_count, omitted_error_count) = compact_string_evidence(
+            errors,
+            SUMMARY_MAX_ERROR_ITEMS,
+            SUMMARY_MAX_ERROR_TEXT_BYTES,
+        );
+        let agent_message = last_agent_message
+            .as_deref()
+            .and_then(|text| normalize_summary_text(text, SUMMARY_MAX_AGENT_MESSAGE_BYTES));
+        let command_digest = build_digest_commands(commands.as_slice());
+        let file_path_digest = build_digest_strings(file_paths.as_slice());
+        let error_digest = build_digest_strings(errors.as_slice());
+        let signal = classify_turn_signal(
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+        );
+        let summary_text = build_compact_turn_summary(
+            status.as_str(),
+            signal,
+            parent_turn_id.as_deref(),
+            child_turn_id,
+            agent_message.as_deref(),
+            command_digest.as_slice(),
+            file_path_digest.as_slice(),
+            error_digest.as_slice(),
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+        );
         let summary = serde_json::json!({
-            "schema_version": "agentcanvas.turn.v1",
+            "schema_version": AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION,
+            "summary_kind": AGENTCANVAS_TURN_SUMMARY_KIND,
             "thread_id": thread_id,
             "session_id": turn_id.clone(),
             "forked_from_thread_id": forked_from_thread_id.clone(),
-            "node_type": "session",
             "nodes": [
                 {
                     "node_id": node_id,
                     "parent_id": parent_node_id,
                     "node_type": "turn",
                     "title": format!("Turn {turn_id}"),
-                    "summary": last_agent_message,
+                    "summary": summary_text,
                     "status": status,
+                    "brief": {
+                        "signal": signal,
+                        "agent_message": agent_message,
+                        "primary_command": command_digest.first().cloned(),
+                        "primary_file_path": file_path_digest.first().cloned(),
+                        "primary_error": error_digest.first().cloned(),
+                    },
                     "lineage": {
                         "parent_turn_id": parent_turn_id,
+                        "child_turn_id": child_turn_id,
                         "forked_from_thread_id": forked_from_thread_id,
                         "started_after_rollback": started_after_rollback,
+                    },
+                    "counts": {
+                        "commands_total": total_command_count,
+                        "commands_indexed": commands.len(),
+                        "commands_omitted": omitted_command_count,
+                        "file_paths_total": total_file_path_count,
+                        "file_paths_indexed": file_paths.len(),
+                        "file_paths_omitted": omitted_file_path_count,
+                        "errors_total": total_error_count,
+                        "errors_indexed": errors.len(),
+                        "errors_omitted": omitted_error_count,
+                    },
+                    "digest": {
+                        "command_examples": command_digest,
+                        "file_path_examples": file_path_digest,
+                        "error_examples": error_digest,
                     },
                     "evidence": {
                         "file_paths": file_paths,
@@ -574,7 +776,7 @@ async fn persist_agentcanvas_turn_summaries(
             summary_id: Some(format!("agentcanvas.turn:{thread_id}:{turn_id}")),
             thread_id: thread_id.to_string(),
             session_id: turn_id.clone(),
-            schema_version: "agentcanvas.turn.v1".to_string(),
+            schema_version: AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION.to_string(),
             root_node_id: Some(node_id),
             summary,
         };
@@ -641,7 +843,7 @@ async fn persist_agentcanvas_turn_summaries(
             schema_version: summary
                 .get("schema_version")
                 .and_then(Value::as_str)
-                .unwrap_or("agentcanvas.turn.v1")
+                .unwrap_or(AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION)
                 .to_string(),
             root_node_id,
             summary,
@@ -1620,6 +1822,7 @@ mod tests {
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::protocol::ViewImageToolCallEvent;
     use pretty_assertions::assert_eq;
     use std::fs::File;
     use std::fs::{self};
@@ -2063,13 +2266,22 @@ mod tests {
             .expect("summary payload should exist");
         assert_eq!(
             summary["schema_version"],
-            serde_json::json!("agentcanvas.turn.v1")
+            serde_json::json!("agentcanvas.turn.v2")
         );
+        assert_eq!(
+            summary["summary_kind"],
+            serde_json::json!("agentcanvas_turn_summary")
+        );
+        assert!(summary.get("node_type").is_none());
         assert_eq!(
             summary["thread_id"],
             serde_json::json!(thread_id_str.clone())
         );
         assert_eq!(summary["session_id"], serde_json::json!(turn_id.clone()));
+        assert_eq!(
+            summary["nodes"][0]["brief"]["signal"],
+            serde_json::json!("error")
+        );
         assert_eq!(
             summary["nodes"][0]["evidence"]["commands"][0]["command"],
             serde_json::json!("rg summary")
@@ -2078,6 +2290,26 @@ mod tests {
             summary["nodes"][0]["evidence"]["errors"][0],
             serde_json::json!("boom")
         );
+        assert_eq!(
+            summary["nodes"][0]["counts"]["commands_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            summary["nodes"][0]["counts"]["commands_omitted"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            summary["nodes"][0]["digest"]["command_examples"][0],
+            serde_json::json!("rg summary")
+        );
+        let summary_text = summary["nodes"][0]["summary"]
+            .as_str()
+            .expect("summary text should exist");
+        assert!(summary_text.contains("status=completed"));
+        assert!(summary_text.contains("signal=error"));
+        assert!(summary_text.contains("primary_command=rg summary"));
+        assert!(summary_text.contains("primary_error=boom"));
+        assert!(summary_text.contains("agent_message=completed"));
 
         let command_matches = state_db
             .search_summary_nodes_by_command_substring("rg summary", 10)
@@ -2086,6 +2318,172 @@ mod tests {
         assert_eq!(command_matches.len(), 1);
         assert_eq!(command_matches[0].thread_id, thread_id_str);
         assert_eq!(command_matches[0].session_id, turn_id);
+        let nodes = state_db
+            .list_summary_nodes_by_thread_and_session(thread_id_str.as_str(), turn_id.as_str(), 10)
+            .await
+            .expect("node list should succeed");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, format!("turn:{turn_id}"));
+
+        recorder.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorder_compacts_agentcanvas_summary_evidence_for_parseability() -> std::io::Result<()>
+    {
+        let home = TempDir::new().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.features.enable(Feature::Sqlite);
+
+        let state_db = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await
+        .expect("state db should initialize");
+
+        let thread_id = ThreadId::new();
+        let turn_id = "turn-compact";
+        let recorder = RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::new(
+                thread_id,
+                None,
+                SessionSource::Cli,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            Some(state_db.clone()),
+            None,
+        )
+        .await?;
+
+        let mut items = vec![turn_started_item(turn_id)];
+        for idx in 0..(SUMMARY_MAX_COMMAND_ITEMS + 7) {
+            items.push(RolloutItem::ResponseItem(ResponseItem::LocalShellCall {
+                id: None,
+                call_id: Some(format!("call-{idx}")),
+                status: LocalShellStatus::Completed,
+                action: LocalShellAction::Exec(LocalShellExecAction {
+                    command: vec!["echo".to_string(), format!("cmd-{idx}")],
+                    timeout_ms: None,
+                    working_directory: None,
+                    env: None,
+                    user: None,
+                }),
+            }));
+        }
+        for idx in 0..(SUMMARY_MAX_FILE_PATH_ITEMS + 3) {
+            items.push(RolloutItem::EventMsg(EventMsg::ViewImageToolCall(
+                ViewImageToolCallEvent {
+                    call_id: format!("view-image-{idx}"),
+                    path: PathBuf::from(format!("/repo/src/file-{idx}.rs")),
+                },
+            )));
+        }
+        for idx in 0..(SUMMARY_MAX_ERROR_ITEMS + 5) {
+            items.push(RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
+                message: format!(
+                    "failure-{idx} {}",
+                    "x".repeat(SUMMARY_MAX_ERROR_TEXT_BYTES + 120)
+                ),
+                codex_error_info: None,
+            })));
+        }
+        items.push(turn_complete_item(
+            turn_id,
+            Some("done ".repeat(SUMMARY_MAX_AGENT_MESSAGE_BYTES).as_str()),
+        ));
+        recorder.record_items(items.as_slice()).await?;
+
+        recorder.persist().await?;
+        recorder.flush().await?;
+
+        let thread_id_str = thread_id.to_string();
+        let summary = state_db
+            .read_session_summary_by_thread_and_session(thread_id_str.as_str(), turn_id)
+            .await
+            .expect("summary read should succeed")
+            .expect("summary payload should exist");
+        let node = &summary["nodes"][0];
+        assert_eq!(
+            node["counts"]["commands_total"],
+            serde_json::json!(SUMMARY_MAX_COMMAND_ITEMS + 7)
+        );
+        assert_eq!(node["counts"]["commands_omitted"], serde_json::json!(7));
+        assert_eq!(
+            node["counts"]["file_paths_total"],
+            serde_json::json!(SUMMARY_MAX_FILE_PATH_ITEMS + 3)
+        );
+        assert_eq!(node["counts"]["file_paths_omitted"], serde_json::json!(3));
+        assert_eq!(
+            node["counts"]["errors_total"],
+            serde_json::json!(SUMMARY_MAX_ERROR_ITEMS + 5)
+        );
+        assert_eq!(node["counts"]["errors_omitted"], serde_json::json!(5));
+        assert_eq!(
+            node["digest"]["command_examples"]
+                .as_array()
+                .expect("command digest should be array")
+                .len(),
+            SUMMARY_DIGEST_ITEMS
+        );
+        assert_eq!(
+            node["digest"]["file_path_examples"]
+                .as_array()
+                .expect("file path digest should be array")
+                .len(),
+            SUMMARY_DIGEST_ITEMS
+        );
+        assert_eq!(
+            node["digest"]["error_examples"]
+                .as_array()
+                .expect("error digest should be array")
+                .len(),
+            SUMMARY_DIGEST_ITEMS
+        );
+        assert_eq!(
+            node["evidence"]["commands"]
+                .as_array()
+                .expect("command evidence should be array")
+                .len(),
+            SUMMARY_MAX_COMMAND_ITEMS
+        );
+        assert_eq!(
+            node["evidence"]["file_paths"]
+                .as_array()
+                .expect("file path evidence should be array")
+                .len(),
+            SUMMARY_MAX_FILE_PATH_ITEMS
+        );
+        assert_eq!(
+            node["evidence"]["errors"]
+                .as_array()
+                .expect("error evidence should be array")
+                .len(),
+            SUMMARY_MAX_ERROR_ITEMS
+        );
+        assert!(
+            node["summary"]
+                .as_str()
+                .expect("summary text should exist")
+                .len()
+                <= SUMMARY_MAX_AGENT_MESSAGE_BYTES
+        );
+        assert_eq!(node["brief"]["signal"], serde_json::json!("error"));
+        assert!(
+            node["brief"]["agent_message"]
+                .as_str()
+                .expect("brief agent message should exist")
+                .len()
+                <= SUMMARY_MAX_AGENT_MESSAGE_BYTES
+        );
 
         recorder.shutdown().await?;
         Ok(())
@@ -2113,7 +2511,7 @@ mod tests {
         let recorder = RolloutRecorder::new(
             &config,
             RolloutRecorderParams::new(
-                thread_id.clone(),
+                thread_id,
                 None,
                 SessionSource::Cli,
                 BaseInstructions::default(),
@@ -2129,8 +2527,8 @@ mod tests {
             .record_items(&[
                 RolloutItem::SessionMeta(SessionMetaLine {
                     meta: SessionMeta {
-                        id: thread_id.clone(),
-                        forked_from_id: Some(forked_from_thread_id.clone()),
+                        id: thread_id,
+                        forked_from_id: Some(forked_from_thread_id),
                         timestamp: "2026-02-28T00:00:00Z".to_string(),
                         cwd: home.path().to_path_buf(),
                         originator: "test_originator".to_string(),
@@ -2169,6 +2567,10 @@ mod tests {
             turn_1_summary["nodes"][0]["lineage"]["forked_from_thread_id"],
             serde_json::json!(forked_from_thread_id_str.clone())
         );
+        assert_eq!(
+            turn_1_summary["nodes"][0]["lineage"]["child_turn_id"],
+            serde_json::json!("turn-2")
+        );
 
         let turn_2_summary = state_db
             .read_session_summary_by_thread_and_session(thread_id_str.as_str(), "turn-2")
@@ -2187,6 +2589,7 @@ mod tests {
             turn_2_summary["nodes"][0]["lineage"]["forked_from_thread_id"],
             serde_json::json!(forked_from_thread_id_str)
         );
+        assert!(turn_2_summary["nodes"][0]["lineage"]["child_turn_id"].is_null());
 
         recorder.shutdown().await?;
         Ok(())
@@ -2213,7 +2616,7 @@ mod tests {
         let recorder = RolloutRecorder::new(
             &config,
             RolloutRecorderParams::new(
-                thread_id.clone(),
+                thread_id,
                 None,
                 SessionSource::Cli,
                 BaseInstructions::default(),

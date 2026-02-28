@@ -5,7 +5,8 @@
 //! explicit `#[serde(rename)]` to match the TypeScript interfaces in
 //! `agentcanvas-ui/src/lib/types.ts`.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use ts_rs::TS;
 
 /// UI-facing event types sent over WebSocket to the frontend.

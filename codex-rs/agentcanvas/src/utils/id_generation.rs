@@ -1,6 +1,7 @@
 //! ID generation utilities
 
-use crate::schema::{ItemId, TurnId};
+use crate::schema::ItemId;
+use crate::schema::TurnId;
 
 /// Generate a turn ID from a counter
 pub fn generate_turn_id(counter: usize) -> TurnId {

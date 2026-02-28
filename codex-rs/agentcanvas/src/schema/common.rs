@@ -1,6 +1,7 @@
 //! Shared enums and types used across the schema
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use ts_rs::TS;
 
 /// Execution status for commands

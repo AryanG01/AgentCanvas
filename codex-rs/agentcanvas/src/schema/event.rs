@@ -1,11 +1,13 @@
 //! Core normalized event schema
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use ts_rs::TS;
 
 use super::common::TokenUsage;
 use super::deltas::DeltaDetails;
-use super::items::{ItemDetails, ItemType};
+use super::items::ItemDetails;
+use super::items::ItemType;
 
 /// Thread identifier (UUID string)
 pub type ThreadId = String;
