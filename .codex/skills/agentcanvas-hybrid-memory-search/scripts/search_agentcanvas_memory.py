@@ -98,6 +98,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def open_readonly_db(db_path: Path) -> sqlite3.Connection:
+    """Try writable first, then fallback to immutable read-only mode."""
+    readonly_uri = f"file:{db_path.as_posix()}?mode=ro&immutable=1"
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.OperationalError as err:
+        if "unable to open database file" not in str(err).lower():
+            raise
+        conn = None
+    else:
+        try:
+            conn.execute("PRAGMA schema_version").fetchall()
+            return conn
+        except sqlite3.OperationalError as err:
+            if "unable to open database file" not in str(err).lower():
+                raise
+            conn.close()
+            conn = None
+
+    conn = sqlite3.connect(
+        readonly_uri,
+        uri=True,
+    )
+    conn.execute("PRAGMA schema_version").fetchall()
+    return conn
+
+
 def resolve_codex_home(args: argparse.Namespace) -> Path:
     if args.codex_home:
         return args.codex_home.expanduser()
@@ -132,7 +159,13 @@ def resolve_db_path(args: argparse.Namespace, codex_home: Path) -> Path:
     if legacy.exists():
         return legacy
 
-    return codex_home / "state_5.sqlite"
+    env_version = os.getenv("CODEX_STATE_DB_VERSION")
+    if env_version and env_version.isdigit():
+        explicit = codex_home / f"state_{env_version}.sqlite"
+        if explicit.exists():
+            return explicit
+
+    return codex_home / "state.sqlite"
 
 
 def ensure_summary_tables(conn: sqlite3.Connection) -> None:
@@ -611,7 +644,7 @@ def run() -> int:
         )
         return 1
 
-    conn = sqlite3.connect(str(db_path))
+    conn = open_readonly_db(db_path)
     conn.row_factory = sqlite3.Row
 
     try:

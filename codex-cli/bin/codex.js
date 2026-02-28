@@ -172,10 +172,113 @@ const packageManagerEnvVar =
     : "CODEX_MANAGED_BY_NPM";
 env[packageManagerEnvVar] = "1";
 
+const interactiveHelperProcesses = [];
+
+function isInteractiveInvocation(args) {
+  if (args.includes("--help") || args.includes("-h") || args.includes("--version") || args.includes("-V")) {
+    return false;
+  }
+
+  const firstPositional = args.find((arg) => arg !== "--" && !arg.startsWith("-"));
+  if (!firstPositional) {
+    return true;
+  }
+
+  const subcommands = new Set([
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "app-server",
+    "app",
+    "completion",
+    "sandbox",
+    "debug",
+    "execpolicy",
+    "apply",
+    "a",
+    "resume",
+    "fork",
+    "cloud",
+    "cloud-tasks",
+    "responses-api-proxy",
+    "stdio-to-uds",
+    "features",
+    "help",
+  ]);
+
+  return !subcommands.has(firstPositional);
+}
+
+function launchBrowser(url) {
+  const command = process.platform === "darwin"
+    ? { cmd: "open", args: [url] }
+    : process.platform === "win32"
+      ? { cmd: "cmd", args: ["/c", "start", "", url] }
+      : { cmd: "xdg-open", args: [url] };
+
+  try {
+    spawn(command.cmd, command.args, {
+      stdio: "ignore",
+      detached: true,
+    }).unref();
+  } catch {
+    // Ignore browser launch failures; keep CLI alive even if no GUI is available.
+  }
+}
+
+function killInteractiveHelpers() {
+  for (const proc of interactiveHelperProcesses) {
+    if (!proc || proc.killed) continue;
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function startAgentcanvasSidecar() {
+  if (process.env.CI || process.env.CI === "true") return;
+  if (process.env.DISABLE_AGENTCANVAS === "1") return;
+
+  const repoRoot = path.resolve(__dirname, "..", "..");
+  const uiRoot = path.join(repoRoot, "agentcanvas-ui");
+  const replayScript = path.join(uiRoot, "scripts", "ws-replay.mjs");
+  const viteScript = path.join(uiRoot, "node_modules", "vite", "bin", "vite.js");
+
+  if (!existsSync(replayScript) || !existsSync(viteScript)) {
+    return;
+  }
+
+  const wsUrlPort = 8080;
+  const uiPort = 5173;
+  const webAppUrl = `http://127.0.0.1:${uiPort}/?autoconnect=1&watch=1`;
+
+  interactiveHelperProcesses.push(
+    spawn(process.execPath, [replayScript, "--watch", "--latest", "--port", `${wsUrlPort}`], {
+      cwd: uiRoot,
+      stdio: "ignore",
+    }),
+    spawn(process.execPath, [viteScript, "--host", "127.0.0.1", "--port", `${uiPort}`], {
+      cwd: uiRoot,
+      stdio: "ignore",
+    }),
+  );
+
+  setTimeout(() => launchBrowser(webAppUrl), 1200);
+}
+
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",
   env,
 });
+
+if (isInteractiveInvocation(process.argv.slice(2))) {
+  startAgentcanvasSidecar();
+}
 
 child.on("error", (err) => {
   // Typically triggered when the binary is missing or not executable.
@@ -183,6 +286,7 @@ child.on("error", (err) => {
   // while still printing a helpful stack trace.
   // eslint-disable-next-line no-console
   console.error(err);
+  killInteractiveHelpers();
   process.exit(1);
 });
 
@@ -212,6 +316,7 @@ const forwardSignal = (signal) => {
 // describing how the child exited: either via exit code or due to a signal.
 const childResult = await new Promise((resolve) => {
   child.on("exit", (code, signal) => {
+    killInteractiveHelpers();
     if (signal) {
       resolve({ type: "signal", signal });
     } else {

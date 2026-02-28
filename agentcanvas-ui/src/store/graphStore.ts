@@ -9,6 +9,9 @@ interface GraphState {
   nodes: Node<GraphNodeData>[]
   edges: Edge[]
   turnOrder: string[]
+  sessionIds: string[]
+  activeSessionId: string | null
+  turnToSession: Map<string, string>
   selectedNodeId: string | null
   searchQuery: string
   wsStatus: WsStatus
@@ -25,6 +28,7 @@ interface GraphState {
   setWsUrl: (url: string) => void
   fetchSessions: () => Promise<void>
   selectSession: (file: string) => void
+  selectActiveSession: (sessionId: string) => void
   toggleTurn: (turnId: string) => void
   reset: () => void
 }
@@ -32,22 +36,45 @@ interface GraphState {
 const REPLAY_API = import.meta.env.VITE_REPLAY_API ?? '/api/sessions'
 const BASE_WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:5173/ws'
 
-const initialState = {
-  events: [] as AppEvent[],
-  nodes: [] as Node<GraphNodeData>[],
-  edges: [] as Edge[],
-  turnOrder: [] as string[],
-  selectedNodeId: null as string | null,
-  searchQuery: '',
-  wsStatus: 'disconnected' as WsStatus,
-  wsUrl: '',  // empty = don't connect until a session is selected
-  sessions: [] as SessionInfo[],
-  selectedSessionFile: null as string | null,
-  expandedTurns: new Set<string>(),
+function createInitialState() {
+  return {
+    events: [] as AppEvent[],
+    nodes: [] as Node<GraphNodeData>[],
+    edges: [] as Edge[],
+    turnOrder: [] as string[],
+    sessionIds: [] as string[],
+    activeSessionId: null as string | null,
+    turnToSession: new Map<string, string>(),
+    selectedNodeId: null as string | null,
+    searchQuery: '',
+    wsStatus: 'disconnected' as WsStatus,
+    wsUrl: '',  // empty = don't connect until a session is selected
+    sessions: [] as SessionInfo[],
+    selectedSessionFile: null as string | null,
+    expandedTurns: new Set<string>(),
+  }
 }
 
-function recompute(events: AppEvent[], expandedTurns: Set<string>) {
-  const { nodes: allNodes, edges: allEdges, turnOrder } = buildGraph(events)
+function eventSessionId(
+  event: AppEvent,
+  turnToSession: Map<string, string>,
+  fallbackSessionId: string | null
+): string | null {
+  if (event.type === 'ThreadStarted') return event.threadId
+  if (event.type === 'TurnStarted') return event.sessionId
+  return turnToSession.get(event.turnId) ?? fallbackSessionId
+}
+
+function recompute(
+  events: AppEvent[],
+  expandedTurns: Set<string>,
+  activeSessionId: string | null,
+  turnToSession: Map<string, string>
+) {
+  const scopedEvents = activeSessionId
+    ? events.filter(event => eventSessionId(event, turnToSession, activeSessionId) === activeSessionId)
+    : events
+  const { nodes: allNodes, edges: allEdges, turnOrder } = buildGraph(scopedEvents)
 
   // Filter: only show event nodes for expanded turns
   const nodes = allNodes.filter(n => {
@@ -73,11 +100,31 @@ function recompute(events: AppEvent[], expandedTurns: Set<string>) {
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
-  ...initialState,
+  ...createInitialState(),
 
   addEvent: (event) => {
-    const events = [...get().events, event]
-    set(recompute(events, get().expandedTurns))
+    const state = get()
+    const events = [...state.events, event]
+    const turnToSession = new Map(state.turnToSession)
+    if (event.type === 'TurnStarted') turnToSession.set(event.turnId, event.sessionId)
+
+    const newestSessionId = eventSessionId(event, turnToSession, state.activeSessionId)
+    const activeSessionId = newestSessionId ?? state.activeSessionId
+    const sessionIds = newestSessionId && !state.sessionIds.includes(newestSessionId)
+      ? [...state.sessionIds, newestSessionId]
+      : state.sessionIds
+    const selectedNodeId =
+      newestSessionId && state.activeSessionId && newestSessionId !== state.activeSessionId
+        ? null
+        : state.selectedNodeId
+
+    set({
+      turnToSession,
+      sessionIds,
+      activeSessionId,
+      selectedNodeId,
+      ...recompute(events, state.expandedTurns, activeSessionId, turnToSession),
+    })
   },
 
   // Retroactively patch the turn label when the userMessage item arrives
@@ -87,7 +134,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         ? { ...e, userPrompt: label }
         : e
     )
-    set(recompute(events, get().expandedTurns))
+    set(recompute(events, get().expandedTurns, get().activeSessionId, get().turnToSession))
   },
 
   selectNode: (id) => set({ selectedNodeId: id }),
@@ -110,23 +157,38 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     // Reset graph state and set new WS URL with ?file= param
     const wsBase = BASE_WS_URL.replace(/\?.*$/, '')  // strip existing params
     const wsUrl = `${wsBase}?file=${encodeURIComponent(file)}`
+    const next = createInitialState()
     set({
-      ...initialState,
+      ...next,
       sessions: get().sessions,  // preserve session list
       selectedSessionFile: file,
       wsUrl,
     })
   },
 
+  selectActiveSession: (sessionId) => {
+    const state = get()
+    if (state.activeSessionId === sessionId) return
+    set({
+      activeSessionId: sessionId,
+      selectedNodeId: null,
+      ...recompute(state.events, state.expandedTurns, sessionId, state.turnToSession),
+    })
+  },
+
   toggleTurn: (turnId) => {
-    const expanded = new Set(get().expandedTurns)
+    const state = get()
+    const expanded = new Set(state.expandedTurns)
     if (expanded.has(turnId)) {
       expanded.delete(turnId)
     } else {
       expanded.add(turnId)
     }
-    set({ expandedTurns: expanded, ...recompute(get().events, expanded) })
+    set({
+      expandedTurns: expanded,
+      ...recompute(state.events, expanded, state.activeSessionId, state.turnToSession),
+    })
   },
 
-  reset: () => set({ ...initialState }),
+  reset: () => set({ ...createInitialState() }),
 }))

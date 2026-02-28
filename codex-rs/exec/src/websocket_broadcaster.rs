@@ -1,16 +1,22 @@
 use crate::event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use codex_core::CodexThread;
-use futures::stream::StreamExt;
 use futures::SinkExt;
+use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 pub type ConnectionId = u64;
 
@@ -104,7 +110,10 @@ pub async fn spawn_websocket_server(
 ) -> anyhow::Result<JoinHandle<()>> {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
     let listener = TcpListener::bind(&addr).await?;
-    info!("WebSocket event streaming server listening on ws://{}", addr);
+    info!(
+        "WebSocket event streaming server listening on ws://{}",
+        addr
+    );
 
     let handle = tokio::spawn(async move {
         loop {
@@ -236,7 +245,10 @@ pub async fn spawn_websocket_infrastructure(
     // Spawn parallel event listener
     let _listener_handle = spawn_websocket_event_listener(thread, broadcaster);
 
-    info!("WebSocket event streaming infrastructure started on port {}", port);
+    info!(
+        "WebSocket event streaming infrastructure started on port {}",
+        port
+    );
 
     Ok(())
 }

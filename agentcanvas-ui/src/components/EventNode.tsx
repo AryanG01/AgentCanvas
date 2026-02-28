@@ -39,6 +39,13 @@ const kindConfig: Record<NodeKind, KindConfig> = {
     border: 'border-zinc-600/30',
     iconBg: 'bg-zinc-700/50 text-zinc-300',
   },
+  output: {
+    icon: '▣',
+    badge: 'bg-emerald-900/60 text-emerald-300 border border-emerald-700/40',
+    badgeText: 'OUT',
+    border: 'border-emerald-700/30',
+    iconBg: 'bg-emerald-900/50 text-emerald-300',
+  },
   error: {
     icon: '✕',
     badge: 'bg-red-900/60 text-red-300 border border-red-700/40',

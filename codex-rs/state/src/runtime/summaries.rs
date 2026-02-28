@@ -10,9 +10,11 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 const SUMMARY_SEMANTIC_EMBEDDING_MODEL: &str = "jina-embeddings-v5-text-nano";
-const SUMMARY_SEMANTIC_JINA_API_KEY_ENV: &str = "JINA_API_KEY";
-const SUMMARY_SEMANTIC_JINA_API_URL_ENV: &str = "JINA_EMBEDDINGS_API_URL";
-const SUMMARY_SEMANTIC_JINA_DEFAULT_API_URL: &str = "https://api.jina.ai/v1/embeddings";
+const SUMMARY_SEMANTIC_EMBEDDING_API_KEY_ENVS: [&str; 2] =
+    ["SUMMARY_EMBEDDINGS_API_KEY", "JINA_API_KEY"];
+const SUMMARY_SEMANTIC_EMBEDDING_API_URL_ENVS: [&str; 2] =
+    ["SUMMARY_EMBEDDINGS_API_URL", "JINA_EMBEDDINGS_API_URL"];
+const SUMMARY_SEMANTIC_EMBEDDING_API_DEFAULT_URL: &str = "https://api.jina.ai/v1/embeddings";
 const HYBRID_SEMANTIC_WEIGHT: f64 = 0.7;
 const HYBRID_LEXICAL_WEIGHT: f64 = 0.3;
 
@@ -43,21 +45,24 @@ struct IndexedSummaryNode {
 }
 
 #[derive(Debug, Serialize)]
-struct JinaEmbeddingsRequest<'a> {
+struct EmbeddingsRequest<'a> {
     model: &'a str,
     input: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]
-struct JinaEmbeddingsResponse {
-    data: Vec<JinaEmbeddingData>,
+struct EmbeddingsResponse {
+    data: Vec<EmbeddingData>,
 }
 
 #[derive(Debug, Deserialize)]
-struct JinaEmbeddingData {
+struct EmbeddingData {
     index: usize,
     embedding: Vec<f32>,
 }
+
+#[derive(Clone)]
+struct HttpSummaryEmbeddingProvider;
 
 impl StateRuntime {
     pub async fn upsert_session_summary(
@@ -85,7 +90,13 @@ impl StateRuntime {
             .iter()
             .map(|node| node.semantic_text.clone())
             .collect();
-        let dense_embeddings = fetch_jina_embeddings(embedding_inputs.as_slice()).await?;
+        let dense_embeddings = self
+            .summary_embedding_provider
+            .embeddings_for(
+                embedding_inputs.as_slice(),
+                SUMMARY_SEMANTIC_EMBEDDING_MODEL,
+            )
+            .await?;
         let root_node_id = params
             .root_node_id
             .clone()
@@ -569,7 +580,10 @@ LIMIT ?
             return Ok(Vec::new());
         }
         let query_input = vec![query.to_string()];
-        if let Some(query_embeddings) = fetch_jina_embeddings(query_input.as_slice()).await?
+        if let Some(query_embeddings) = self
+            .summary_embedding_provider
+            .embeddings_for(query_input.as_slice(), SUMMARY_SEMANTIC_EMBEDDING_MODEL)
+            .await?
             && let Some(query_embedding) = query_embeddings.first()
         {
             let dense_matches = self
@@ -724,7 +738,8 @@ INNER JOIN summary_artifacts AS artifacts
 ORDER BY scored_nodes.semantic_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
 "#,
         );
-        let rows = sql.build().fetch_all(self.pool.as_ref()).await?;
+        let query = sql.build();
+        let rows = query.fetch_all(self.pool.as_ref()).await?;
         rows.iter()
             .map(summary_semantic_node_match_from_row)
             .collect()
@@ -833,7 +848,8 @@ INNER JOIN summary_artifacts AS artifacts
 ORDER BY scored_nodes.lexical_score DESC, artifacts.updated_at DESC, nodes.node_id ASC
 "#,
         );
-        let rows = sql.build().fetch_all(self.pool.as_ref()).await?;
+        let query = sql.build();
+        let rows = query.fetch_all(self.pool.as_ref()).await?;
         rows.iter()
             .map(summary_semantic_node_match_from_row)
             .collect()
@@ -899,14 +915,11 @@ INNER JOIN summary_artifacts AS artifacts
 INNER JOIN candidate_nodes
     ON candidate_nodes.summary_id = embeddings.summary_id
     AND candidate_nodes.node_id = embeddings.node_id
-WHERE embeddings.embedding_model = ?
+WHERE embeddings.embedding_model =
             "#,
         );
-        let rows = sql
-            .push_bind(SUMMARY_SEMANTIC_EMBEDDING_MODEL)
-            .build()
-            .fetch_all(self.pool.as_ref())
-            .await?;
+        let query = sql.push_bind(SUMMARY_SEMANTIC_EMBEDDING_MODEL).build();
+        let rows = query.fetch_all(self.pool.as_ref()).await?;
 
         let mut scored = Vec::new();
         for row in &rows {
@@ -969,18 +982,24 @@ WHERE embeddings.embedding_model = ?
             return Ok(Vec::new());
         }
 
+        let mut query_terms_values = String::new();
+        for term in &query_terms {
+            if !query_terms_values.is_empty() {
+                query_terms_values.push_str(", ");
+            }
+            query_terms_values.push_str(&format!(
+                "({}, {})",
+                term.term_hash,
+                (term.weight_milli as f64) / 1000.0
+            ));
+        }
+
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut sql = QueryBuilder::<Sqlite>::new(
+        let model = SUMMARY_SEMANTIC_EMBEDDING_MODEL.replace('\'', "''");
+        let sql = format!(
             r#"
 WITH query_terms(term_hash, query_weight) AS (
-"#,
-        );
-        sql.push_values(query_terms.iter(), |mut row, term| {
-            row.push_bind(term.term_hash)
-                .push_bind((term.weight_milli as f64) / 1000.0);
-        });
-        sql.push(
-            r#"
+    VALUES {query_terms_values}
 )
 SELECT
     terms.summary_id,
@@ -991,15 +1010,15 @@ INNER JOIN summary_node_semantic_terms AS terms
     AND terms.node_id = embeddings.node_id
 INNER JOIN query_terms
     ON query_terms.term_hash = terms.term_hash
-WHERE embeddings.embedding_model = ?
+WHERE embeddings.embedding_model = '{model}'
 GROUP BY terms.summary_id, terms.node_id
 ORDER BY SUM(terms.weight * query_terms.query_weight) DESC
-LIMIT
-"#,
-        )
-        .push_bind(SUMMARY_SEMANTIC_EMBEDDING_MODEL)
-        .push_bind(limit);
-        let rows = sql.build().fetch_all(self.pool.as_ref()).await?;
+LIMIT {limit}
+"#
+        );
+        let rows = sqlx::query(sql.as_str())
+            .fetch_all(self.pool.as_ref())
+            .await?;
         rows.iter()
             .map(|row| Ok((row.try_get("summary_id")?, row.try_get("node_id")?)))
             .collect()
@@ -1544,68 +1563,88 @@ fn embedding_dot_product(left: &[f32], right: &[f32]) -> f64 {
         .sum::<f64>()
 }
 
-async fn fetch_jina_embeddings(inputs: &[String]) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
-    if inputs.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
+pub(crate) fn default_embedding_provider() -> Arc<dyn SummaryEmbeddingProvider> {
+    Arc::new(HttpSummaryEmbeddingProvider)
+}
 
-    let Ok(api_key) = std::env::var(SUMMARY_SEMANTIC_JINA_API_KEY_ENV) else {
-        return Ok(None);
-    };
-    if api_key.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let api_url = std::env::var(SUMMARY_SEMANTIC_JINA_API_URL_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SUMMARY_SEMANTIC_JINA_DEFAULT_API_URL.to_string());
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let response = match client
-        .post(api_url)
-        .bearer_auth(api_key)
-        .json(&JinaEmbeddingsRequest {
-            model: SUMMARY_SEMANTIC_EMBEDDING_MODEL,
-            input: inputs,
-        })
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => return Ok(None),
-    };
-    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-
-    let payload = match response.json::<JinaEmbeddingsResponse>().await {
-        Ok(payload) => payload,
-        Err(_) => return Ok(None),
-    };
-
-    let mut ordered_embeddings = vec![None; inputs.len()];
-    for item in payload.data {
-        if item.index < ordered_embeddings.len() {
-            ordered_embeddings[item.index] = Some(item.embedding);
+#[async_trait]
+impl SummaryEmbeddingProvider for HttpSummaryEmbeddingProvider {
+    async fn embeddings_for(
+        &self,
+        inputs: &[String],
+        model: &str,
+    ) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+        if inputs.is_empty() {
+            return Ok(Some(Vec::new()));
         }
-    }
-    let mut embeddings = Vec::with_capacity(ordered_embeddings.len());
-    for embedding in ordered_embeddings {
-        let Some(embedding) = embedding else {
+
+        let Some(api_key) = embedding_api_key() else {
             return Ok(None);
         };
-        if embedding.is_empty() {
+
+        let api_url = embedding_api_url();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let response = match client
+            .post(api_url)
+            .bearer_auth(api_key)
+            .json(&EmbeddingsRequest {
+                model,
+                input: inputs,
+            })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return Ok(None),
+        };
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
             return Ok(None);
         }
-        embeddings.push(embedding);
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let payload = match response.json::<EmbeddingsResponse>().await {
+            Ok(payload) => payload,
+            Err(_) => return Ok(None),
+        };
+
+        let mut ordered_embeddings = vec![None; inputs.len()];
+        for item in payload.data {
+            if item.index < ordered_embeddings.len() {
+                ordered_embeddings[item.index] = Some(item.embedding);
+            }
+        }
+        let mut embeddings = Vec::with_capacity(ordered_embeddings.len());
+        for embedding in ordered_embeddings {
+            let Some(embedding) = embedding else {
+                return Ok(None);
+            };
+            if embedding.is_empty() {
+                return Ok(None);
+            }
+            embeddings.push(embedding);
+        }
+        Ok(Some(embeddings))
     }
-    Ok(Some(embeddings))
+}
+
+fn embedding_api_key() -> Option<String> {
+    SUMMARY_SEMANTIC_EMBEDDING_API_KEY_ENVS
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn embedding_api_url() -> String {
+    SUMMARY_SEMANTIC_EMBEDDING_API_URL_ENVS
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| SUMMARY_SEMANTIC_EMBEDDING_API_DEFAULT_URL.to_string())
 }
 
 #[cfg(test)]
@@ -1614,6 +1653,40 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::sync::Arc;
+
+    struct MockSummaryEmbeddingProvider;
+
+    impl MockSummaryEmbeddingProvider {
+        fn embedding_for_text(text: &str) -> Vec<Vec<f32>> {
+            if text.contains("Deploy") || text.contains("deploy") || text.contains("release") {
+                vec![vec![0.0, 1.0]]
+            } else {
+                vec![vec![1.0, 0.0]]
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SummaryEmbeddingProvider for MockSummaryEmbeddingProvider {
+        async fn embeddings_for(
+            &self,
+            inputs: &[String],
+            model: &str,
+        ) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+            if model != SUMMARY_SEMANTIC_EMBEDDING_MODEL {
+                return Ok(None);
+            }
+            if inputs.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let embeddings = inputs
+                .iter()
+                .flat_map(|input| Self::embedding_for_text(input.as_str()))
+                .collect();
+            Ok(Some(embeddings))
+        }
+    }
 
     fn sample_summary_with_evidence() -> Value {
         json!({
@@ -1852,9 +1925,14 @@ mod tests {
     #[tokio::test]
     async fn summary_semantic_search_returns_relevant_nodes() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init_with_summary_embedding_provider(
+            codex_home.clone(),
+            "test-provider".to_string(),
+            None,
+            Some(Arc::new(MockSummaryEmbeddingProvider)),
+        )
+        .await
+        .expect("initialize runtime");
         runtime
             .upsert_session_summary(&SessionSummaryPersistParams {
                 summary_id: None,
@@ -1906,9 +1984,14 @@ mod tests {
     #[tokio::test]
     async fn summary_hybrid_search_combines_semantic_and_lexical_scores() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init_with_summary_embedding_provider(
+            codex_home.clone(),
+            "test-provider".to_string(),
+            None,
+            Some(Arc::new(MockSummaryEmbeddingProvider)),
+        )
+        .await
+        .expect("initialize runtime");
         runtime
             .upsert_session_summary(&SessionSummaryPersistParams {
                 summary_id: None,

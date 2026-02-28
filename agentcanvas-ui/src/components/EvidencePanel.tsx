@@ -1,5 +1,6 @@
 import { useGraphStore } from '../store/graphStore'
 import type {
+  AssistantMessageEvent,
   CommandExecutionEvent,
   GraphNodeData,
   McpToolCallEvent,
@@ -24,12 +25,13 @@ export function EvidencePanel() {
     tool:    'text-blue-400',
     patch:   'text-green-400',
     plan:    'text-zinc-400',
+    output:  'text-emerald-400',
     error:   'text-red-400',
   }
 
   const kindLabels: Record<string, string> = {
     turn: 'TURN', command: 'CMD', tool: 'MCP TOOL',
-    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR',
+    patch: 'FILE PATCH', plan: 'PLAN', output: 'OUTPUT', error: 'ERROR',
   }
 
   return (
@@ -62,6 +64,8 @@ export function EvidencePanel() {
           <PatchDetail event={rawEvent as PatchApplyEvent} />
         ) : kind === 'plan' ? (
           <PlanDetail event={rawEvent as PlanUpdateEvent} />
+        ) : kind === 'output' ? (
+          <OutputDetail event={rawEvent as AssistantMessageEvent} />
         ) : kind === 'turn' ? (
           <TurnDetail event={rawEvent as TurnStartedEvent} />
         ) : (
@@ -201,6 +205,14 @@ function PlanDetail({ event }: { event: PlanUpdateEvent }) {
   return (
     <Section title="Plan">
       <CodeBlock className="text-zinc-200">{event.text}</CodeBlock>
+    </Section>
+  )
+}
+
+function OutputDetail({ event }: { event: AssistantMessageEvent }) {
+  return (
+    <Section title="Assistant Output">
+      <CodeBlock className="text-emerald-100">{event.text}</CodeBlock>
     </Section>
   )
 }

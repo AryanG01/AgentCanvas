@@ -27,6 +27,7 @@ use crate::model::ThreadRow;
 use crate::model::anchor_from_item;
 use crate::model::datetime_to_epoch_seconds;
 use crate::paths::file_modified_time_utc;
+use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_otel::OtelManager;
@@ -61,6 +62,15 @@ mod summaries;
 mod test_support;
 mod threads;
 
+#[async_trait]
+pub(crate) trait SummaryEmbeddingProvider: Send + Sync {
+    async fn embeddings_for(
+        &self,
+        inputs: &[String],
+        model: &str,
+    ) -> anyhow::Result<Option<Vec<Vec<f32>>>>;
+}
+
 // "Partition" is the retention bucket we cap at 10 MiB:
 // - one bucket per non-null thread_id
 // - one bucket per threadless (thread_id IS NULL) non-null process_uuid
@@ -71,6 +81,7 @@ const LOG_PARTITION_SIZE_LIMIT_BYTES: i64 = 10 * 1024 * 1024;
 pub struct StateRuntime {
     codex_home: PathBuf,
     default_provider: String,
+    summary_embedding_provider: Arc<dyn SummaryEmbeddingProvider>,
     pool: Arc<sqlx::SqlitePool>,
 }
 
@@ -82,6 +93,15 @@ impl StateRuntime {
         codex_home: PathBuf,
         default_provider: String,
         otel: Option<OtelManager>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::init_with_summary_embedding_provider(codex_home, default_provider, otel, None).await
+    }
+
+    pub(crate) async fn init_with_summary_embedding_provider(
+        codex_home: PathBuf,
+        default_provider: String,
+        otel: Option<OtelManager>,
+        summary_embedding_provider: Option<Arc<dyn SummaryEmbeddingProvider>>,
     ) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&codex_home).await?;
         remove_legacy_state_files(&codex_home).await;
@@ -101,6 +121,8 @@ impl StateRuntime {
             otel.counter(METRIC_DB_INIT, 1, &[("status", "opened")]);
         }
         let runtime = Arc::new(Self {
+            summary_embedding_provider: summary_embedding_provider
+                .unwrap_or_else(summaries::default_embedding_provider),
             pool,
             codex_home,
             default_provider,

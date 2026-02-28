@@ -3,8 +3,9 @@
 ## Paths
 - SQLite DB default resolution in the script:
   1. `--db`
-  2. latest `state_<N>.sqlite` under `--codex-home` / `CODEX_SQLITE_HOME` / `CODEX_HOME` / `~/.codex`
-  3. `state.sqlite` fallback
+  2. latest numeric `state_<N>.sqlite` under `--codex-home` / `CODEX_SQLITE_HOME` / `CODEX_HOME` / `~/.codex`
+  3. `state.sqlite` legacy fallback
+  4. `state_<N>.sqlite` where `N` is `CODEX_STATE_DB_VERSION` (if set)
 - Summary JSON artifacts are written under:
   - `<codex_home>/agentcanvas/summaries/<thread_id>/<session_id>.json`
 

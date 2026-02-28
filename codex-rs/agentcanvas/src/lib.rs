@@ -15,17 +15,31 @@ pub mod summary;
 pub mod utils;
 
 // Re-export public API
-pub use schema::{
-    common::*, deltas::*, event::*, items::*, EventPayload, EventSource, ItemId,
-    NormalizedEvent, ThreadId, TurnId,
-};
+pub use schema::EventPayload;
+pub use schema::EventSource;
+pub use schema::ItemId;
+pub use schema::NormalizedEvent;
+pub use schema::ThreadId;
+pub use schema::TurnId;
+pub use schema::common::*;
+pub use schema::deltas::*;
+pub use schema::event::*;
+pub use schema::items::*;
 
-pub use bridge::{translate as translate_to_app_event, AppEvent};
+pub use bridge::AppEvent;
+pub use bridge::translate as translate_to_app_event;
 
-pub use summary::{
-    CommandEvidence, EventReference, LlmSummaryConfig, SessionSummary, SessionSummaryMetadata,
-    SessionSummarizer, SummaryEvidence, SummaryNode, SummaryNodeType, TurnLineage,
-    SESSION_SUMMARY_SCHEMA_VERSION,
-};
+pub use summary::CommandEvidence;
+pub use summary::EventReference;
+pub use summary::LlmSummaryConfig;
+pub use summary::SESSION_SUMMARY_SCHEMA_VERSION;
+pub use summary::SessionSummarizer;
+pub use summary::SessionSummary;
+pub use summary::SessionSummaryMetadata;
+pub use summary::SummaryEvidence;
+pub use summary::SummaryNode;
+pub use summary::SummaryNodeType;
+pub use summary::TurnLineage;
 
-pub use utils::{generate_item_id, generate_turn_id};
+pub use utils::generate_item_id;
+pub use utils::generate_turn_id;

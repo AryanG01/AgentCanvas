@@ -121,6 +121,7 @@ export function GraphCanvas() {
             if (kind === 'tool') return '#3b82f6'
             if (kind === 'patch') return '#22c55e'
             if (kind === 'plan') return '#a1a1aa'
+            if (kind === 'output') return '#34d399'
             return '#eab308'
           }}
         />

@@ -1,5 +1,5 @@
 import type { Node, Edge } from '@xyflow/react'
-import type { AppEvent, CommandExecutionEvent, GraphNodeData, NodeKind } from './types'
+import type { AppEvent, CommandExecutionEvent, GraphNodeData } from './types'
 
 type GraphNode = Node<GraphNodeData>
 
@@ -7,6 +7,22 @@ export interface GraphResult {
   nodes: GraphNode[]
   edges: Edge[]
   turnOrder: string[]  // ordered list of turnIds for sequential flow edges
+}
+
+function isNoisyPlanText(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed) return true
+
+  const lower = trimmed.toLowerCase()
+  if (lower.startsWith('# agents.md instructions for')) return true
+  if (lower.startsWith('<turn_aborted>')) return true
+  if (lower.startsWith('<environment_context>')) return true
+  if (lower.startsWith('<permissions instructions>')) return true
+  if (lower.startsWith('<collaboration_mode>')) return true
+  if (lower.startsWith('warning: apply_patch was requested via exec_command')) return true
+  if (lower.includes('what should i work on')) return true
+
+  return false
 }
 
 export function buildGraph(events: AppEvent[]): GraphResult {
@@ -180,6 +196,9 @@ export function buildGraph(events: AppEvent[]): GraphResult {
         data: { kind: 'detail' },
       })
     } else if (event.type === 'PlanUpdate') {
+      if (isNoisyPlanText(event.text)) {
+        continue
+      }
       nodes.push({
         id: `event-${event.id}`,
         type: 'eventNode',
@@ -188,6 +207,25 @@ export function buildGraph(events: AppEvent[]): GraphResult {
           kind: 'plan',
           label: event.text.slice(0, 60),
           status: 'info',
+          turnId: event.turnId,
+          rawEvent: event,
+        },
+      })
+      edges.push({
+        id: `detail-${event.id}`,
+        source: `turn-${event.turnId}`,
+        target: `event-${event.id}`,
+        data: { kind: 'detail' },
+      })
+    } else if (event.type === 'AssistantMessage') {
+      nodes.push({
+        id: `event-${event.id}`,
+        type: 'eventNode',
+        position: { x: 0, y: 0 },
+        data: {
+          kind: 'output',
+          label: event.text.slice(0, 60),
+          status: 'success',
           turnId: event.turnId,
           rawEvent: event,
         },

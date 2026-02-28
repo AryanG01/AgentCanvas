@@ -500,9 +500,13 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     spawn_thread_listener(primary_thread_id, thread.clone(), tx.clone(), false);
 
     // Spawn WebSocket event streaming infrastructure
-    match websocket_broadcaster::spawn_websocket_infrastructure(websocket_port, thread.clone()).await
+    match websocket_broadcaster::spawn_websocket_infrastructure(websocket_port, thread.clone())
+        .await
     {
-        Ok(_) => info!("WebSocket event streaming on ws://127.0.0.1:{}", websocket_port),
+        Ok(_) => info!(
+            "WebSocket event streaming on ws://127.0.0.1:{}",
+            websocket_port
+        ),
         Err(err) => warn!(
             "WebSocket server failed to start: {}. Continuing without streaming.",
             err

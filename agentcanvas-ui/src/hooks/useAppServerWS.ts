@@ -5,6 +5,21 @@ import type { AppEvent } from '../lib/types'
 const MAX_BACKOFF = 30_000
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 
+function isInternalUserPrompt(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed) return true
+
+  const lower = trimmed.toLowerCase()
+  if (lower.startsWith('# agents.md instructions for')) return true
+  if (lower.startsWith('<turn_aborted>')) return true
+  if (lower.startsWith('<environment_context>')) return true
+  if (lower.startsWith('<permissions instructions>')) return true
+  if (lower.startsWith('<collaboration_mode>')) return true
+  if (lower.startsWith('warning: apply_patch was requested via exec_command')) return true
+
+  return false
+}
+
 // ---------------------------------------------------------------------------
 // Map a real app-server ThreadItem (camelCase JSON) → our internal AppEvent
 // ---------------------------------------------------------------------------
@@ -59,6 +74,20 @@ function normalizeItem(item: Record<string, unknown>, turnId: string): AppEvent 
         ts: Date.now(),
       }
     }
+    case 'agentMessage':
+    case 'agent_message': {
+      const text = ((item.text as string) ?? '').trim()
+      if (!text) return null
+      const phase = item.phase as string | undefined
+      if (phase && phase !== 'final_answer') return null
+      return {
+        type: 'AssistantMessage',
+        id,
+        turnId,
+        text,
+        ts: Date.now(),
+      }
+    }
     default:
       return null
   }
@@ -73,10 +102,19 @@ export function useAppServerWS(overrideUrl?: string) {
   const backoffRef = useRef(1000)
   const unmountedRef = useRef(false)
   const url = overrideUrl ?? storeUrl
+  const isReplayStyle = (address: string) => {
+    try {
+      const parsed = new URL(address, window.location.origin)
+      return parsed.searchParams.has('file') || parsed.searchParams.has('watch')
+    } catch {
+      return false
+    }
+  }
 
   useEffect(() => {
     if (USE_MOCK) return  // skip WS entirely in mock mode
     if (!url) return       // no URL yet — wait for session selection
+    const replayStyle = isReplayStyle(url)
 
     unmountedRef.current = false
 
@@ -90,8 +128,7 @@ export function useAppServerWS(overrideUrl?: string) {
         backoffRef.current = 1000
         setWsStatus('connected')
         // Skip handshake for replay connections (they start streaming immediately)
-        const isReplay = url.includes('?file=')
-        if (!isReplay) {
+        if (!replayStyle) {
           ws.send(JSON.stringify({
             method: 'initialize',
             id: 0,
@@ -139,8 +176,8 @@ export function useAppServerWS(overrideUrl?: string) {
             // userMessage → extract prompt text and retroactively update turn label
             if (item.type === 'userMessage') {
               const content = item.content as Array<{ type: string; text: string }>
-              const text = content?.find(c => c.type === 'text')?.text ?? ''
-              if (text) updateTurnLabel(turnId, text)
+              const text = (content?.find(c => c.type === 'text')?.text ?? '').trim()
+              if (text && !isInternalUserPrompt(text)) updateTurnLabel(turnId, text)
               return
             }
 
@@ -156,8 +193,7 @@ export function useAppServerWS(overrideUrl?: string) {
         if (unmountedRef.current) return
         setWsStatus('disconnected')
         // Don't auto-reconnect for replay sessions
-        const isReplay = url.includes('?file=')
-        if (!isReplay) {
+        if (!replayStyle) {
           const delay = backoffRef.current
           backoffRef.current = Math.min(delay * 2, MAX_BACKOFF)
           setTimeout(connect, delay)

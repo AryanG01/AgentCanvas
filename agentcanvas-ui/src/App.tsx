@@ -4,6 +4,7 @@ import { GraphCanvas } from './components/GraphCanvas'
 import { EvidencePanel } from './components/EvidencePanel'
 import { SearchBar } from './components/SearchBar'
 import { SessionPicker } from './components/SessionPicker'
+import { SessionTabs } from './components/SessionTabs'
 import { ConnectPanel } from './components/ConnectPanel'
 import { useAppServerWS } from './hooks/useAppServerWS'
 import { useGraphStore } from './store/graphStore'
@@ -14,6 +15,7 @@ const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 function AppInner() {
   const addEvent = useGraphStore(s => s.addEvent)
   const nodes = useGraphStore(s => s.nodes)
+  const setWsUrl = useGraphStore(s => s.setWsUrl)
   useAppServerWS()
 
   useEffect(() => {
@@ -24,11 +26,24 @@ function AppInner() {
     return () => timers.forEach(clearTimeout)
   }, [])
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (!params.has('autoconnect') && !params.has('watch')) return
+
+    const baseUrl = import.meta.env.VITE_WS_URL ?? '/ws'
+    const file = params.get('file')
+    const nextUrl = file
+      ? `${baseUrl}?file=${encodeURIComponent(file)}`
+      : `${baseUrl}?watch=1`
+    setWsUrl(nextUrl)
+  }, [setWsUrl])
+
   const isEmpty = nodes.length === 0
 
   return (
     <div className="w-screen h-screen relative overflow-hidden bg-zinc-950">
       <SessionPicker />
+      <SessionTabs />
       <SearchBar />
       <GraphCanvas />
       <EvidencePanel />

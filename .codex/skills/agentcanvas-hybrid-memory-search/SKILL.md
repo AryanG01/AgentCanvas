@@ -42,6 +42,7 @@ For each selected memory hit, report:
 
 ## Troubleshooting
 - If the DB path is wrong, pass `--db <path>` or `--codex-home <dir>`.
+- Current default DB naming is `state_<N>.sqlite` (current versioned format), with legacy fallback to `state.sqlite`.
 - If summary tables are missing, the local state DB was created before summary migrations.
 - If tables exist but are empty, run additional Codex sessions with sqlite enabled so summaries are persisted.
 - For schema/storage details, read `references/storage-and-index-notes.md`.

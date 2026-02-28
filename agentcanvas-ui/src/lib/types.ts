@@ -73,6 +73,14 @@ export interface PlanUpdateEvent {
   ts: number
 }
 
+export interface AssistantMessageEvent {
+  type: 'AssistantMessage'
+  id: string
+  turnId: string
+  text: string
+  ts: number
+}
+
 /** Internal synthetic event — updates a turn node's label from the userMessage item */
 export interface UserPromptPatchEvent {
   type: 'UserPromptPatch'
@@ -89,13 +97,14 @@ export type AppEvent =
   | McpToolCallEvent
   | PatchApplyEvent
   | PlanUpdateEvent
+  | AssistantMessageEvent
   | UserPromptPatchEvent
 
 // ---------------------------------------------------------------------------
 // Graph node types
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error'
+export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'output' | 'error'
 
 export interface GraphNodeData {
   kind: NodeKind
