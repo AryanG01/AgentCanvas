@@ -15,6 +15,7 @@ AgentCanvas session summaries.
   - `summary_node_file_paths`
   - `summary_node_commands`
   - `summary_node_errors`
+  - `summary_node_semantic_terms`
 
 ## Runtime API
 
@@ -35,6 +36,7 @@ AgentCanvas session summaries.
   - `search_summary_nodes_by_file_path(...)`
   - `search_summary_nodes_by_command_substring(...)`
   - `search_summary_nodes_by_error_text(...)`
+  - `search_summary_nodes_by_semantic_text(...)`
 
 ## Core integration
 
@@ -74,6 +76,10 @@ All query methods return indexed node matches with:
   - command keys: `command`, `commands`, `cmd`
   - error keys: `error`, `errors`, `error_text`, `errortext`, `last_error`,
     `stderr`
+- Semantic indexing is lightweight/local:
+  - builds sparse hashed token vectors from node metadata/evidence text.
+  - stores normalized term weights in SQLite (`summary_node_semantic_terms`).
+  - query-time cosine scoring is computed via SQL join against query terms.
 
 ## Update semantics
 

@@ -27,6 +27,7 @@ pub use memories::Stage1StartupClaimParams;
 pub use summary::SessionSummaryArtifact;
 pub use summary::SessionSummaryNodeMatch;
 pub use summary::SessionSummaryPersistParams;
+pub use summary::SessionSummarySemanticNodeMatch;
 pub use thread_metadata::Anchor;
 pub use thread_metadata::BackfillStats;
 pub use thread_metadata::ExtractionOutcome;
