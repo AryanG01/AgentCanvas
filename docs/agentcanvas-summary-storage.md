@@ -42,6 +42,11 @@ AgentCanvas session summaries.
   the rollout writer path.
 - As rollout items stream in, a per-thread turn accumulator tracks command/file/error
   evidence from persisted rollout items.
+- Recorder lineage handling now includes fork/backtracking metadata:
+  - parent turn linkage is tracked per completed turn and stored as `parent_id`.
+  - fork ancestry is read from `SessionMeta.forked_from_id`.
+  - `ThreadRolledBack` events pop active lineage and mark rolled-back turn
+    summaries with `status = "rolled_back"`.
 - On `TurnComplete` or `TurnAborted`, core calls
   `StateRuntime::upsert_session_summary(...)` with:
   - `thread_id` = session thread id
