@@ -1957,6 +1957,7 @@ dependencies = [
  "codex-utils-oss",
  "codex-utils-sandbox-summary",
  "core_test_support",
+ "futures",
  "libc",
  "owo-colors",
  "predicates",
@@ -1968,6 +1969,7 @@ dependencies = [
  "supports-color 3.0.2",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "ts-rs",
@@ -2028,6 +2030,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-protocol",
+ "openssl-sys",
  "pretty_assertions",
  "sentry",
  "tracing",

@@ -99,3 +99,75 @@ This folder is the root of a Cargo workspace. It contains quite a bit of experim
 - [`cli/`](./cli) CLI multitool that provides the aforementioned CLIs via subcommands.
 
 If you want to contribute or inspect behavior in detail, start by reading the module-level `README.md` files under each crate and run the project workspace from the top-level `codex-rs` directory so shared config, features, and build scripts stay aligned.
+
+## Building from Source
+
+### Using Nix (Recommended for Linux)
+
+The project includes a Nix flake with all necessary dependencies for building, including support for cross-compilation. This is the easiest way to ensure you have all required system libraries (libcap, openssl, etc.).
+
+#### Quick Start with Nix
+
+```shell
+# Enter the development environment
+nix develop
+
+# Build the project
+cargo build
+
+# Run tests
+cargo test
+
+# Build release binary
+cargo build --release
+```
+
+#### Cross-Compilation
+
+The flake provides specialized development shells for cross-compilation:
+
+```shell
+# Cross-compile for musl (static linking)
+nix develop .#cross-linux-musl
+cargo build --target x86_64-unknown-linux-musl
+
+# Cross-compile for ARM64
+nix develop .#cross-aarch64
+cargo build --target aarch64-unknown-linux-gnu
+```
+
+#### Automatic Environment with direnv
+
+For automatic environment activation when entering the directory, install [direnv](https://direnv.net/) and run:
+
+```shell
+direnv allow
+```
+
+The `.envrc` file will automatically load the Nix environment.
+
+### Building without Nix
+
+If you're not using Nix, ensure you have the following system dependencies installed:
+
+**On Linux:**
+- `libcap` and `libcap-dev`
+- `pkg-config`
+- `openssl` and `libssl-dev`
+- `cmake`
+- `clang`
+
+**On macOS:**
+- Xcode Command Line Tools
+- `openssl` (via Homebrew)
+
+**On Windows:**
+- Visual Studio Build Tools
+- OpenSSL (via vcpkg or binary distribution)
+
+Then build with cargo:
+
+```shell
+cargo build
+cargo test
+```

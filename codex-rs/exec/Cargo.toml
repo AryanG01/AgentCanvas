@@ -27,6 +27,7 @@ codex-utils-cli = { workspace = true }
 codex-utils-elapsed = { workspace = true }
 codex-utils-oss = { workspace = true }
 codex-utils-sandbox-summary = { workspace = true }
+futures = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -35,10 +36,12 @@ supports-color = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
 ] }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 ts-rs = { workspace = true, features = [

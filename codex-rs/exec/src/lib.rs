@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
+mod websocket_broadcaster;
 
 pub use cli::Cli;
 pub use cli::Command;
@@ -118,6 +119,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         output_schema: output_schema_path,
         config_overrides,
         progress_cursor,
+        websocket_port,
     } = cli;
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
@@ -496,6 +498,16 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ThreadEventEnvelope>();
     let attached_threads = Arc::new(Mutex::new(HashSet::from([primary_thread_id])));
     spawn_thread_listener(primary_thread_id, thread.clone(), tx.clone(), false);
+
+    // Spawn WebSocket event streaming infrastructure
+    match websocket_broadcaster::spawn_websocket_infrastructure(websocket_port, thread.clone()).await
+    {
+        Ok(_) => info!("WebSocket event streaming on ws://127.0.0.1:{}", websocket_port),
+        Err(err) => warn!(
+            "WebSocket server failed to start: {}. Continuing without streaming.",
+            err
+        ),
+    }
 
     {
         let thread = thread.clone();
