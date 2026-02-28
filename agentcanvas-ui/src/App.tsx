@@ -16,13 +16,15 @@ const USE_JSONL = import.meta.env.VITE_USE_JSONL !== 'false'
 function AppInner() {
   const addEvent = useGraphStore(s => s.addEvent)
   const nodes = useGraphStore(s => s.nodes)
+  const wsStatus = useGraphStore(s => s.wsStatus)
 
   // Use JSONL hook or app-server hook based on env var
-  if (USE_JSONL) {
-    useCodexJsonlWS()
-  } else {
-    useAppServerWS()
-  }
+  // Always call both hooks unconditionally (React Rules of Hooks), but pass null to disable the inactive one
+  const jsonlUrl = USE_JSONL ? undefined : null  // undefined = use store default, null = disable
+  const appServerUrl = USE_JSONL ? null : undefined  // null = disable, undefined = use store default
+
+  useCodexJsonlWS(jsonlUrl)   // Always called, but null disables it
+  useAppServerWS(appServerUrl) // Always called, but null disables it
 
   useEffect(() => {
     if (!USE_MOCK) return
@@ -40,7 +42,23 @@ function AppInner() {
       <SearchBar />
       <GraphCanvas />
       <EvidencePanel />
-      {!USE_MOCK && <ConnectPanel />}
+      {!USE_MOCK && !USE_JSONL && <ConnectPanel />}
+
+      {/* JSONL connection status indicator */}
+      {USE_JSONL && (
+        <div className="absolute top-4 right-4 flex items-center gap-2 text-xs">
+          <div className={`w-2 h-2 rounded-full ${
+            wsStatus === 'connected' ? 'bg-green-500' :
+            wsStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
+            'bg-red-500'
+          }`} />
+          <span className="text-zinc-400">
+            {wsStatus === 'connected' ? 'Connected' :
+             wsStatus === 'connecting' ? 'Connecting...' :
+             'Disconnected'}
+          </span>
+        </div>
+      )}
 
       {/* Empty state */}
       {isEmpty && (

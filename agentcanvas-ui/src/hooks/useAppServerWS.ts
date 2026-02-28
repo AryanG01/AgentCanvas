@@ -69,7 +69,7 @@ function toNumber(value: unknown): number {
   return Number.isFinite(num) ? num : 0
 }
 
-export function useAppServerWS(overrideUrl?: string) {
+export function useAppServerWS(overrideUrl?: string | null) {
   const addEvent = useGraphStore(s => s.addEvent)
   const setWsStatus = useGraphStore(s => s.setWsStatus)
   const updateTurnLabel = useGraphStore(s => s.updateTurnLabel)
@@ -77,10 +77,11 @@ export function useAppServerWS(overrideUrl?: string) {
   const wsRef = useRef<WebSocket | null>(null)
   const backoffRef = useRef(1000)
   const unmountedRef = useRef(false)
-  const url = overrideUrl ?? storeUrl
+  const url = overrideUrl === null ? null : (overrideUrl ?? storeUrl)
 
   useEffect(() => {
     if (USE_MOCK) return  // skip WS entirely in mock mode
+    if (url === null) return  // Disabled
     if (!url) return       // no URL yet — wait for session selection
 
     unmountedRef.current = false

@@ -150,7 +150,7 @@ function normalizeItem(item: JsonlThreadItem, turnId: string): AppEvent | null {
 // Hook implementation
 // ---------------------------------------------------------------------------
 
-export function useCodexJsonlWS(overrideUrl?: string) {
+export function useCodexJsonlWS(overrideUrl?: string | null) {
   const addEvent = useGraphStore(s => s.addEvent)
   const setWsStatus = useGraphStore(s => s.setWsStatus)
   const updateTurnLabel = useGraphStore(s => s.updateTurnLabel)
@@ -160,9 +160,10 @@ export function useCodexJsonlWS(overrideUrl?: string) {
   const unmountedRef = useRef(false)
   const currentTurnId = useRef<string | null>(null)
   const currentThreadId = useRef<string | null>(null)
-  const url = overrideUrl ?? storeUrl
+  const url = overrideUrl === null ? null : (overrideUrl ?? storeUrl)
 
   useEffect(() => {
+    if (url === null) return  // Disabled
     if (!url) return // no URL yet
 
     unmountedRef.current = false
