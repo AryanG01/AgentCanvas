@@ -23,8 +23,8 @@ const nodeTypes = {
 
 // Flow edges (session→turn, turn→turn): thick, solid indigo
 const FLOW_EDGE_STYLE = {
-  stroke: '#6366f1',
-  strokeWidth: 2.5,
+  stroke: '#818cf8',
+  strokeWidth: 2.8,
 }
 const FLOW_MARKER = {
   type: MarkerType.ArrowClosed,
@@ -35,15 +35,15 @@ const FLOW_MARKER = {
 
 // Detail edges (turn→item): thin, dashed zinc
 const DETAIL_EDGE_STYLE = {
-  stroke: '#52525b',
-  strokeWidth: 1.5,
-  strokeDasharray: '5 4',
+  stroke: '#71717a',
+  strokeWidth: 1.4,
+  strokeDasharray: '4 5',
 }
 const DETAIL_MARKER = {
   type: MarkerType.ArrowClosed,
-  width: 12,
-  height: 12,
-  color: '#52525b',
+  width: 11,
+  height: 11,
+  color: '#71717a',
 }
 
 export function GraphCanvas() {
@@ -69,10 +69,13 @@ export function GraphCanvas() {
     const isFlow = kind === 'flow'
     return {
       ...e,
-      type: isFlow ? 'smoothstep' : 'default',
+      type: 'smoothstep',
       style: isFlow ? FLOW_EDGE_STYLE : DETAIL_EDGE_STYLE,
       markerEnd: isFlow ? FLOW_MARKER : DETAIL_MARKER,
       animated: isFlow,
+      pathOptions: isFlow
+        ? { offset: 28, borderRadius: 18 }
+        : { offset: 20, borderRadius: 12 },
     }
   })
 
@@ -90,22 +93,22 @@ export function GraphCanvas() {
   )
 
   return (
-    <div className="w-full h-full bg-zinc-950">
+    <div className="w-full h-full bg-[radial-gradient(circle_at_15%_10%,rgba(55,65,81,0.35),transparent_36%),radial-gradient(circle_at_85%_90%,rgba(30,41,59,0.28),transparent_32%),#09090b]">
       <ReactFlow
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
         onNodeClick={onNodeClick}
         fitView
-        fitViewOptions={{ padding: 0.2 }}
+        fitViewOptions={{ padding: 0.1, maxZoom: 1.15 }}
         minZoom={0.15}
         proOptions={{ hideAttribution: true }}
       >
         <Background
-          variant={BackgroundVariant.Dots}
+          variant={BackgroundVariant.Lines}
           color="#27272a"
-          gap={20}
-          size={1.5}
+          gap={32}
+          size={0.7}
         />
         <Controls
           showInteractive={false}

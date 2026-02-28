@@ -22,29 +22,31 @@ function AppInner() {
       setTimeout(() => addEvent(event), i * 300)
     )
     return () => timers.forEach(clearTimeout)
-  }, [])
+  }, [addEvent])
 
   const isEmpty = nodes.length === 0
 
   return (
-    <div className="w-screen h-screen relative overflow-hidden bg-zinc-950">
+    <div className="w-screen h-screen overflow-hidden bg-zinc-950 flex flex-col md:flex-row">
       <SessionPicker />
-      <SearchBar />
-      <GraphCanvas />
-      <EvidencePanel />
-      {!USE_MOCK && <ConnectPanel />}
+      <main className="relative flex-1 min-w-0 min-h-0">
+        <SearchBar />
+        <GraphCanvas />
+        <EvidencePanel />
+        {!USE_MOCK && <ConnectPanel />}
 
-      {/* Empty state */}
-      {isEmpty && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-          <div className="text-center space-y-2">
-            <p className="text-zinc-600 text-sm font-medium">No session data yet</p>
-            <p className="text-zinc-700 text-xs">
-              {USE_MOCK ? 'Loading mock events…' : 'Connect to a Codex session to begin'}
-            </p>
+        {/* Empty state */}
+        {isEmpty && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <div className="text-center space-y-2">
+              <p className="text-zinc-600 text-sm font-medium">No session data yet</p>
+              <p className="text-zinc-700 text-xs">
+                {USE_MOCK ? 'Loading mock events…' : 'Connect to a Codex session to begin'}
+              </p>
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </main>
     </div>
   )
 }

@@ -229,6 +229,84 @@ function findAllRollouts(dir) {
   return results;
 }
 
+function normalizeSessionTitle(value) {
+  if (typeof value !== "string") return null;
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+  return compact.slice(0, 140);
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === "string") return normalizeSessionTitle(content);
+  if (!Array.isArray(content)) return null;
+
+  for (const part of content) {
+    if (typeof part === "string") {
+      const normalized = normalizeSessionTitle(part);
+      if (normalized) return normalized;
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+
+    const text =
+      (typeof part.text === "string" && part.text)
+      || (typeof part.input_text === "string" && part.input_text)
+      || (typeof part.content === "string" && part.content)
+      || null;
+    const normalized = normalizeSessionTitle(text);
+    if (normalized) return normalized;
+  }
+
+  return null;
+}
+
+function extractFirstUserPrompt(obj) {
+  if (!obj || typeof obj !== "object") return null;
+
+  const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : {};
+
+  if (obj.type === "event_msg") {
+    if (payload.type === "user_message") {
+      return normalizeSessionTitle(payload.message);
+    }
+    if (payload.type === "task_started") {
+      return (
+        normalizeSessionTitle(payload.user_prompt)
+        || normalizeSessionTitle(payload.user_input)
+        || normalizeSessionTitle(payload.prompt)
+        || normalizeSessionTitle(payload.input)
+        || normalizeSessionTitle(payload.message)
+      );
+    }
+  }
+
+  if (obj.type === "turn_context") {
+    return (
+      normalizeSessionTitle(payload.user_prompt)
+      || normalizeSessionTitle(payload.userPrompt)
+      || normalizeSessionTitle(payload.user_input)
+      || normalizeSessionTitle(payload.input)
+      || normalizeSessionTitle(payload.prompt)
+      || extractTextFromContent(payload.messages)
+    );
+  }
+
+  if (obj.type === "response_item") {
+    if (payload.type === "user_message") {
+      return (
+        normalizeSessionTitle(payload.message)
+        || normalizeSessionTitle(payload.text)
+        || extractTextFromContent(payload.content)
+      );
+    }
+    if (payload.type === "message" && payload.role === "user") {
+      return extractTextFromContent(payload.content);
+    }
+  }
+
+  return null;
+}
+
 function readSessionInfo(filePath) {
   try {
     const content = readFileSync(filePath, "utf-8");
@@ -237,6 +315,7 @@ function readSessionInfo(filePath) {
     let meta = null;
     let taskStartedCount = 0;
     let turnContextCount = 0;
+    let firstPrompt = null;
 
     for (const line of lines) {
       try {
@@ -244,6 +323,7 @@ function readSessionInfo(filePath) {
         if (obj.type === "session_meta" && !meta) meta = obj.payload;
         if (obj.type === "event_msg" && obj.payload?.type === "task_started") taskStartedCount++;
         if (obj.type === "turn_context") turnContextCount++;
+        if (!firstPrompt) firstPrompt = extractFirstUserPrompt(obj);
       } catch {
         // skip
       }
@@ -262,6 +342,7 @@ function readSessionInfo(filePath) {
       cwd: meta.cwd || "",
       file: filePath,
       id: meta.id,
+      title: firstPrompt,
     };
   } catch {
     return null;

@@ -173,4 +173,5 @@ export interface SessionInfo {
   cwd: string
   file: string
   id: string
+  title?: string | null
 }
