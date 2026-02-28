@@ -75,8 +75,6 @@ mod color;
 pub mod custom_terminal;
 mod cwd_prompt;
 mod debug_config;
-mod websocket_broadcaster;
-mod http_server;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
@@ -85,6 +83,7 @@ mod file_search;
 mod frames;
 mod get_git_diff;
 mod history_cell;
+mod http_server;
 pub mod insert_history;
 mod key_hint;
 mod line_truncation;
@@ -123,6 +122,7 @@ mod updates;
 mod version;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 mod voice;
+mod websocket_broadcaster;
 #[cfg(all(not(target_os = "linux"), not(feature = "voice-input")))]
 mod voice {
     use crate::app_event::AppEvent;
@@ -918,11 +918,53 @@ async fn run_ratatui_app(
         no_alt_screen,
         websocket_port,
         ui_enabled,
+        no_ui,
         ui_port,
         ui_dist_path,
         no_browser,
         ..
     } = cli;
+
+    let ui_enabled = ui_enabled || !no_ui;
+
+    let ui_dist_path = if ui_enabled && ui_dist_path.is_none() {
+        let mut candidates = Vec::new();
+
+        if let Ok(cwd) = std::env::current_dir() {
+            for ancestor in cwd.ancestors() {
+                candidates.push(ancestor.join("agentcanvas-ui").join("dist"));
+                if ancestor.ends_with("codex-rs") {
+                    candidates.push(ancestor.join("..").join("agentcanvas-ui").join("dist"));
+                }
+            }
+        }
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            for ancestor in exe_path.ancestors() {
+                candidates.push(ancestor.join("agentcanvas-ui").join("dist"));
+                if ancestor.ends_with("codex-rs") {
+                    candidates.push(ancestor.join("..").join("agentcanvas-ui").join("dist"));
+                }
+            }
+        }
+
+        if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+            candidates.push(PathBuf::from(manifest_dir).join("../../agentcanvas-ui/dist"));
+        }
+
+        let resolved_dist = candidates
+            .into_iter()
+            .filter_map(|candidate| dunce::canonicalize(candidate).ok())
+            .find(|candidate| candidate.join("index.html").is_file());
+
+        if let Some(path) = resolved_dist.as_ref() {
+            tracing::info!("Auto-detected AgentCanvas UI dist path: {}", path.display());
+        }
+
+        resolved_dist
+    } else {
+        ui_dist_path
+    };
 
     let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
     tui.set_alt_screen_enabled(use_alt_screen);

@@ -3,7 +3,7 @@ import { useGraphStore } from '../store/graphStore'
 const statusConfig = {
   connected:    { dot: 'bg-green-400',                   text: 'text-green-400',  label: 'Live' },
   connecting:   { dot: 'bg-yellow-400 animate-pulse',    text: 'text-yellow-400', label: 'Connecting…' },
-  disconnected: { dot: 'bg-zinc-600',                    text: 'text-zinc-500',   label: 'Mock' },
+  disconnected: { dot: 'bg-zinc-600',                    text: 'text-zinc-500',   label: 'Disconnected' },
 }
 
 export function SearchBar() {

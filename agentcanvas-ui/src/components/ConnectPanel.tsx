@@ -6,7 +6,11 @@ export function ConnectPanel() {
   const wsUrl = useGraphStore(s => s.wsUrl)
   const setWsUrl = useGraphStore(s => s.setWsUrl)
   const reset = useGraphStore(s => s.reset)
-  const [editUrl, setEditUrl] = useState(wsUrl)
+  const localWsUrl =
+    typeof window === 'undefined'
+      ? 'ws://127.0.0.1:3737'
+      : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:3737`
+  const [editUrl, setEditUrl] = useState(wsUrl || localWsUrl)
   const [open, setOpen] = useState(false)
 
   if (wsStatus === 'connected') return null  // hide when connected
@@ -24,22 +28,33 @@ export function ConnectPanel() {
       ) : (
         <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-4 shadow-2xl w-[380px] space-y-3">
           <div className="flex items-center justify-between">
-            <span className="text-sm font-semibold text-zinc-100">Connect to app-server</span>
+            <span className="text-sm font-semibold text-zinc-100">Connect Live Stream</span>
             <button onClick={() => setOpen(false)} className="text-zinc-500 hover:text-white text-lg">×</button>
           </div>
           <p className="text-xs text-zinc-400 leading-relaxed">
-            Start the Codex app-server with WebSocket transport, then paste the URL below.
+            Codex should auto-connect in live mode. If needed, use local defaults or paste a custom WebSocket URL.
           </p>
           <div className="bg-zinc-800 rounded-lg p-2.5 font-mono text-xs text-green-300 border border-zinc-700">
-            codex app-server --listen ws://127.0.0.1:8080
+            codex --ui --websocket-port 3737
           </div>
           <div className="flex gap-2">
+            <button
+              onClick={() => {
+                reset()
+                setWsUrl(localWsUrl)
+                setEditUrl(localWsUrl)
+                setOpen(false)
+              }}
+              className="bg-zinc-800 hover:bg-zinc-700 text-zinc-100 text-sm font-medium px-3 py-1.5 rounded-lg border border-zinc-700 transition-colors"
+            >
+              Use Local
+            </button>
             <input
               type="text"
               value={editUrl}
               onChange={e => setEditUrl(e.target.value)}
               className="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-indigo-500"
-              placeholder="ws://localhost:8080"
+              placeholder={localWsUrl}
             />
             <button
               onClick={() => {

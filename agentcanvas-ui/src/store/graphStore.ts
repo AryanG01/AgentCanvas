@@ -29,8 +29,60 @@ interface GraphState {
   reset: () => void
 }
 
-const REPLAY_API = import.meta.env.VITE_REPLAY_API ?? '/api/sessions'
-const BASE_WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:5173/ws'
+function getQueryParam(name: string): string | null {
+  if (typeof window === 'undefined') return null
+  return new URLSearchParams(window.location.search).get(name)
+}
+
+function computeDefaultWsUrl(): string {
+  const wsFromQuery = getQueryParam('ws')
+  if (wsFromQuery) return wsFromQuery
+
+  const wsPortFromQuery = getQueryParam('wsPort')
+  if (wsPortFromQuery && typeof window !== 'undefined') {
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    return `${protocol}://${window.location.hostname}:${wsPortFromQuery}`
+  }
+
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL
+  if (typeof window === 'undefined') return ''
+
+  const liveFromQuery = getQueryParam('live')
+  const liveModeRequested = liveFromQuery === '1' || liveFromQuery === 'true'
+  if (!liveModeRequested) return ''
+
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  // codex --ui default websocket port
+  return `${protocol}://${window.location.hostname}:3737`
+}
+
+function computeDefaultReplayApi(): string {
+  const replayApiFromQuery = getQueryParam('replayApi')
+  if (replayApiFromQuery) return replayApiFromQuery
+
+  if (import.meta.env.VITE_REPLAY_API) return import.meta.env.VITE_REPLAY_API
+  if (typeof window === 'undefined') return ''
+
+  // In Vite dev, use the proxy. When served by codex, replay is optional and usually disabled.
+  if (window.location.port === '5173') return '/api/sessions'
+  return ''
+}
+
+function computeDefaultReplayWsUrl(): string {
+  const replayWsFromQuery = getQueryParam('replayWs')
+  if (replayWsFromQuery) return replayWsFromQuery
+
+  if (import.meta.env.VITE_REPLAY_WS_URL) return import.meta.env.VITE_REPLAY_WS_URL
+  if (typeof window === 'undefined') return ''
+
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  if (window.location.port === '5173') return `${protocol}://${window.location.host}/ws`
+  return ''
+}
+
+const REPLAY_API = computeDefaultReplayApi()
+const REPLAY_WS_URL = computeDefaultReplayWsUrl()
+const DEFAULT_WS_URL = computeDefaultWsUrl()
 
 const initialState = {
   events: [] as AppEvent[],
@@ -40,7 +92,7 @@ const initialState = {
   selectedNodeId: null as string | null,
   searchQuery: '',
   wsStatus: 'disconnected' as WsStatus,
-  wsUrl: '',  // empty = don't connect until a session is selected
+  wsUrl: DEFAULT_WS_URL,
   sessions: [] as SessionInfo[],
   selectedSessionFile: null as string | null,
   expandedTurns: new Set<string>(),
@@ -107,6 +159,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   setWsUrl: (url) => set({ wsUrl: url }),
 
   fetchSessions: async () => {
+    if (!REPLAY_API) return
     try {
       const res = await fetch(REPLAY_API)
       if (!res.ok) return
@@ -118,8 +171,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   selectSession: (file) => {
+    if (!REPLAY_WS_URL) return
     // Reset graph state and set new WS URL with ?file= param
-    const wsBase = BASE_WS_URL.replace(/\?.*$/, '')  // strip existing params
+    const wsBase = REPLAY_WS_URL.replace(/\?.*$/, '')  // strip existing params
     const wsUrl = `${wsBase}?file=${encodeURIComponent(file)}`
     set({
       ...initialState,

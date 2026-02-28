@@ -1,20 +1,44 @@
-use codex_exec::event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
-use codex_core::CodexThread;
-use futures::stream::StreamExt;
+use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnAbortReason;
 use futures::SinkExt;
+use futures::stream::StreamExt;
+use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::{debug, error, info, warn};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 pub type ConnectionId = u64;
 
 const WEBSOCKET_CHANNEL_CAPACITY: usize = 128;
+
+struct WebSocketRuntime {
+    broadcaster: WebSocketEventBroadcaster,
+    stream_state: Mutex<WebSocketStreamState>,
+}
+
+static WEBSOCKET_RUNTIME: OnceLock<WebSocketRuntime> = OnceLock::new();
+
+#[derive(Default)]
+struct WebSocketStreamState {
+    thread_id: Option<String>,
+}
 
 /// Manages WebSocket clients and broadcasts events to them.
 pub struct WebSocketEventBroadcaster {
@@ -96,15 +120,160 @@ impl Clone for WebSocketEventBroadcaster {
     }
 }
 
+/// Spawns only the WebSocket server and registers a global broadcaster runtime.
+/// Callers can stream protocol events later via `broadcast_protocol_event`.
+pub async fn spawn_websocket_server_only(port: u16) -> anyhow::Result<(JoinHandle<()>, u16)> {
+    if WEBSOCKET_RUNTIME.get().is_some() {
+        anyhow::bail!("WebSocket runtime already initialized");
+    }
+
+    let broadcaster = WebSocketEventBroadcaster::new();
+    let (server_handle, bound_port) = spawn_websocket_server(port, broadcaster.clone()).await?;
+
+    let runtime = WebSocketRuntime {
+        broadcaster,
+        stream_state: Mutex::new(WebSocketStreamState::default()),
+    };
+    if WEBSOCKET_RUNTIME.set(runtime).is_err() {
+        anyhow::bail!("WebSocket runtime already initialized");
+    }
+
+    Ok((server_handle, bound_port))
+}
+
+/// Converts a protocol event to app-server-style WS notifications and broadcasts them.
+/// No-op when the websocket runtime has not been started.
+pub async fn broadcast_protocol_event(event: &Event) {
+    let Some(runtime) = WEBSOCKET_RUNTIME.get() else {
+        return;
+    };
+
+    let notifications = {
+        let mut stream_state = runtime
+            .stream_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        protocol_event_to_notifications(event, &mut stream_state)
+    };
+
+    for notification in notifications {
+        match serde_json::to_string(&notification) {
+            Ok(json) => {
+                runtime.broadcaster.broadcast(json).await;
+            }
+            Err(e) => {
+                error!("Failed to serialize event for WebSocket: {}", e);
+            }
+        }
+    }
+}
+
+fn protocol_event_to_notifications(
+    event: &Event,
+    stream_state: &mut WebSocketStreamState,
+) -> Vec<serde_json::Value> {
+    match &event.msg {
+        EventMsg::SessionConfigured(ev) => {
+            let thread_id = ev.session_id.to_string();
+            stream_state.thread_id = Some(thread_id.clone());
+            vec![json!({
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": thread_id,
+                    },
+                },
+            })]
+        }
+        EventMsg::TurnStarted(ev) => {
+            let Some(thread_id) = stream_state.thread_id.as_ref() else {
+                return Vec::new();
+            };
+
+            vec![json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {
+                        "id": ev.turn_id,
+                        "status": "in_progress",
+                    },
+                },
+            })]
+        }
+        EventMsg::TurnComplete(ev) => vec![json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": ev.turn_id,
+                    "status": "completed",
+                },
+            },
+        })],
+        EventMsg::TurnAborted(ev) => {
+            let Some(turn_id) = ev.turn_id.as_ref() else {
+                return Vec::new();
+            };
+
+            let status = match ev.reason {
+                TurnAbortReason::Interrupted
+                | TurnAbortReason::Replaced
+                | TurnAbortReason::ReviewEnded => "cancelled",
+            };
+
+            vec![json!({
+                "method": "turn/completed",
+                "params": {
+                    "turn": {
+                        "id": turn_id,
+                        "status": status,
+                    },
+                },
+            })]
+        }
+        EventMsg::ItemStarted(ev) => {
+            let thread_id = ev.thread_id.to_string();
+            stream_state.thread_id = Some(thread_id.clone());
+            let item = AppServerThreadItem::from(ev.item.clone());
+            vec![json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": ev.turn_id,
+                    "item": item,
+                },
+            })]
+        }
+        EventMsg::ItemCompleted(ev) => {
+            let thread_id = ev.thread_id.to_string();
+            stream_state.thread_id = Some(thread_id.clone());
+            let item = AppServerThreadItem::from(ev.item.clone());
+            vec![json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": ev.turn_id,
+                    "item": item,
+                },
+            })]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Spawns the WebSocket server on the specified port.
 /// Returns a JoinHandle for the server task.
 pub async fn spawn_websocket_server(
     port: u16,
     broadcaster: WebSocketEventBroadcaster,
-) -> anyhow::Result<JoinHandle<()>> {
+) -> anyhow::Result<(JoinHandle<()>, u16)> {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
     let listener = TcpListener::bind(&addr).await?;
-    info!("WebSocket event streaming server listening on ws://{}", addr);
+    let bound_port = listener.local_addr()?.port();
+    info!(
+        "WebSocket event streaming server listening on ws://127.0.0.1:{}",
+        bound_port
+    );
 
     let handle = tokio::spawn(async move {
         loop {
@@ -121,19 +290,22 @@ pub async fn spawn_websocket_server(
         }
     });
 
-    Ok(handle)
+    Ok((handle, bound_port))
 }
 
 /// Handles a single WebSocket client connection.
 async fn handle_websocket_client(stream: TcpStream, broadcaster: WebSocketEventBroadcaster) {
     // Upgrade the TCP connection to WebSocket
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            error!("WebSocket upgrade failed: {}", e);
-            return;
-        }
-    };
+    let ws_stream =
+        match tokio_tungstenite::accept_async_with_config(stream, Some(WebSocketConfig::default()))
+            .await
+        {
+            Ok(ws) => ws,
+            Err(e) => {
+                error!("WebSocket upgrade failed: {}", e);
+                return;
+            }
+        };
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = mpsc::channel::<String>(WEBSOCKET_CHANNEL_CAPACITY);
@@ -183,60 +355,4 @@ async fn handle_websocket_client(stream: TcpStream, broadcaster: WebSocketEventB
     }
 
     broadcaster.remove_client(client_id).await;
-}
-
-/// Spawns a parallel event listener that consumes events from CodexThread
-/// and broadcasts them to all WebSocket clients.
-pub fn spawn_websocket_event_listener(
-    thread: Arc<CodexThread>,
-    broadcaster: WebSocketEventBroadcaster,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        // Create a dedicated event processor for converting protocol events to JSONL
-        let mut event_processor = EventProcessorWithJsonOutput::new(None);
-
-        loop {
-            match thread.next_event().await {
-                Ok(event) => {
-                    // Convert protocol event to ThreadEvent(s)
-                    let thread_events = event_processor.collect_thread_events(&event);
-
-                    // Serialize and broadcast each ThreadEvent
-                    for thread_event in thread_events {
-                        match serde_json::to_string(&thread_event) {
-                            Ok(json) => {
-                                broadcaster.broadcast(json).await;
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize event for WebSocket: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("WebSocket event listener stopped: {}", e);
-                    break;
-                }
-            }
-        }
-    })
-}
-
-/// Spawns the complete WebSocket infrastructure: server + event listener.
-/// Returns an error if the server fails to start, but does not block TUI execution.
-pub async fn spawn_websocket_infrastructure(
-    port: u16,
-    thread: Arc<CodexThread>,
-) -> anyhow::Result<()> {
-    let broadcaster = WebSocketEventBroadcaster::new();
-
-    // Spawn WebSocket server
-    let _server_handle = spawn_websocket_server(port, broadcaster.clone()).await?;
-
-    // Spawn parallel event listener
-    let _listener_handle = spawn_websocket_event_listener(thread, broadcaster);
-
-    info!("WebSocket event streaming infrastructure started on port {}", port);
-
-    Ok(())
 }
