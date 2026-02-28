@@ -44,4 +44,6 @@ pub struct SessionSummarySemanticNodeMatch {
     pub node_match: SessionSummaryNodeMatch,
     pub embedding_model: String,
     pub semantic_score: f64,
+    pub lexical_score: f64,
+    pub hybrid_score: f64,
 }
