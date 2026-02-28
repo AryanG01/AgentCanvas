@@ -12,6 +12,9 @@ use crate::LogRow;
 use crate::METRIC_DB_INIT;
 use crate::STATE_DB_FILENAME;
 use crate::STATE_DB_VERSION;
+use crate::SessionSummaryArtifact;
+use crate::SessionSummaryNodeMatch;
+use crate::SessionSummaryPersistParams;
 use crate::SortKey;
 use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
@@ -52,6 +55,7 @@ mod agent_jobs;
 mod backfill;
 mod logs;
 mod memories;
+mod summaries;
 #[cfg(test)]
 mod test_support;
 mod threads;
