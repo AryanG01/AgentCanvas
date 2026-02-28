@@ -14,6 +14,7 @@ pub(crate) mod policy;
 pub mod recorder;
 pub(crate) mod session_index;
 pub(crate) mod truncation;
+pub(crate) mod turn_summary_llm;
 
 pub use codex_protocol::protocol::SessionMeta;
 pub(crate) use error::map_session_init_error;
