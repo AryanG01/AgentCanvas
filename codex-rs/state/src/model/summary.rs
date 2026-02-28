@@ -42,5 +42,6 @@ pub struct SessionSummaryNodeMatch {
 #[derive(Clone, Debug)]
 pub struct SessionSummarySemanticNodeMatch {
     pub node_match: SessionSummaryNodeMatch,
+    pub embedding_model: String,
     pub semantic_score: f64,
 }

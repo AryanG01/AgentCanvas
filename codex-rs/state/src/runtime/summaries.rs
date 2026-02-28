@@ -5,6 +5,8 @@ use sqlx::sqlite::SqliteRow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+const SUMMARY_SEMANTIC_EMBEDDING_MODEL: &str = "jina-embeddings-v5-text-nano";
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct IndexedCommand {
     command: String,
@@ -652,6 +654,7 @@ fn summary_semantic_node_match_from_row(
 ) -> anyhow::Result<SessionSummarySemanticNodeMatch> {
     Ok(SessionSummarySemanticNodeMatch {
         node_match: summary_node_match_from_row(row)?,
+        embedding_model: SUMMARY_SEMANTIC_EMBEDDING_MODEL.to_string(),
         semantic_score: row.try_get("semantic_score")?,
     })
 }
@@ -1320,6 +1323,10 @@ mod tests {
             .expect("semantic search should succeed");
         assert!(!test_matches.is_empty());
         assert_eq!(test_matches[0].node_match.node_id, "test-node");
+        assert_eq!(
+            test_matches[0].embedding_model,
+            "jina-embeddings-v5-text-nano"
+        );
         assert!(test_matches[0].semantic_score > 0.0);
 
         let deploy_matches = runtime

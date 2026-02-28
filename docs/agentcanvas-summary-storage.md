@@ -77,6 +77,7 @@ All query methods return indexed node matches with:
   - error keys: `error`, `errors`, `error_text`, `errortext`, `last_error`,
     `stderr`
 - Semantic indexing is lightweight/local:
+  - configured embedding model id: `jina-embeddings-v5-text-nano`.
   - builds sparse hashed token vectors from node metadata/evidence text.
   - stores normalized term weights in SQLite (`summary_node_semantic_terms`).
   - query-time cosine scoring is computed via SQL join against query terms.
