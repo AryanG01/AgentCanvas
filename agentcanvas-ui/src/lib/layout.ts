@@ -2,7 +2,6 @@ import { Position, type Node, type Edge } from '@xyflow/react'
 import type { GraphNodeData, NodeKind } from './types'
 
 // Node dimensions
-const SESSION_W = 260
 const SESSION_H = 56
 const TURN_W = 240
 const TURN_H = 90    // taller to show prompt

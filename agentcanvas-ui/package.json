@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:jsonl": "vite build",
+    "build:jsonl:typecheck": "tsc -b && vite build",
+    "dev:jsonl": "vite",
     "lint": "eslint .",
     "preview": "vite preview",
     "replay": "node scripts/ws-replay.mjs --latest --speed 10",

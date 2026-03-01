@@ -108,6 +108,10 @@ pub struct Cli {
     )]
     pub last_message_file: Option<PathBuf>,
 
+    /// Port for WebSocket event streaming server (always enabled).
+    #[arg(long = "websocket-port", default_value_t = 3737, global = true)]
+    pub websocket_port: u16,
+
     /// Initial instructions for the agent. If not provided as an argument (or
     /// if `-` is used), instructions are read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
