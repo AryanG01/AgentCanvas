@@ -95,21 +95,21 @@ function MiniStats({ event }: { event: SummaryNodeEvent }) {
 export const EventNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
   const cfg = kindConfig[data.kind]
   const isSummaryLike = data.kind === 'summary' || data.kind === 'phase'
-  const width = isSummaryLike ? 'w-[240px]' : 'w-[210px]'
+  const width = isSummaryLike ? 'w-[280px]' : 'w-[228px]'
   const summaryEvent = isSummaryLike ? (data.rawEvent as SummaryNodeEvent) : null
 
   return (
     <div
       className={`
-        ${width} rounded-lg border px-3 py-2 shadow-lg
-        bg-zinc-800/90 backdrop-blur-sm text-white
+        ${width} rounded-xl border px-3.5 py-2.5 shadow-lg
+        bg-zinc-900/88 backdrop-blur-sm text-white
         transition-all duration-150
         ${selected ? 'border-indigo-400 shadow-indigo-500/20 shadow-xl' : cfg.border}
       `}
     >
       <Handle
         type="target"
-        position={Position.Top}
+        position={Position.Left}
         className="!bg-zinc-600 !border-zinc-500 !w-1.5 !h-1.5"
       />
 
@@ -138,7 +138,7 @@ export const EventNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
 
       <Handle
         type="source"
-        position={Position.Bottom}
+        position={Position.Right}
         className="!bg-zinc-600 !border-zinc-500 !w-1.5 !h-1.5"
       />
     </div>
