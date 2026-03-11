@@ -16,15 +16,15 @@ export const TurnNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
   return (
     <div
       className={`
-        w-[240px] rounded-xl border-2 px-4 py-3 shadow-xl
-        bg-gradient-to-b from-zinc-800 to-zinc-900 text-white
+        w-[240px] rounded-2xl border-2 px-4 py-3 shadow-xl
+        bg-gradient-to-br from-zinc-800 to-zinc-900 text-white
         transition-all duration-150
         ${selected ? 'border-indigo-400 shadow-indigo-500/20 shadow-2xl' : `${cfg.ring} border`}
       `}
     >
       <Handle
         type="target"
-        position={Position.Top}
+        position={Position.Left}
         className="!bg-zinc-600 !border-zinc-500 !w-2 !h-2"
       />
 
@@ -59,7 +59,7 @@ export const TurnNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
 
       <Handle
         type="source"
-        position={Position.Bottom}
+        position={Position.Right}
         className="!bg-zinc-600 !border-zinc-500 !w-2 !h-2"
       />
     </div>

@@ -58,6 +58,10 @@ AgentCanvas session summaries.
   - deterministic summary id = `agentcanvas.turn:<thread_id>:<turn_id>`
 - Summary payloads now use `schema_version = "agentcanvas.turn.v2"` and include:
   - top-level `summary_kind = "agentcanvas_turn_summary"`
+  - `nodes[].summary` now follows a stable three-part format for readability + parsing:
+    - `Outcome: ...`
+    - `Evidence: ...`
+    - `Lineage: ...`
   - per-node parse-oriented fields: `brief`, `lineage`, `counts`, `digest`, `evidence`
   - bounded evidence arrays with explicit `*_omitted` counts so payloads stay concise.
   - no top-level `node_type`; only actual summary nodes are stored under `nodes[]`.
@@ -85,6 +89,8 @@ All query methods return indexed node matches with:
   - file path keys: `file`, `files`, `file_path`, `file_paths`, `filepath`,
     `filepaths`, `path`, `paths`, `primary_file_path`
   - command keys: `command`, `commands`, `cmd`, `primary_command`
+    - structured command objects with `exit_code` / `exitCode` / related status
+      fields are indexed with exit status metadata.
   - error keys: `error`, `errors`, `error_text`, `errortext`, `last_error`,
     `stderr`, `primary_error`
 - Semantic indexing is lightweight/local:
@@ -94,6 +100,10 @@ All query methods return indexed node matches with:
     `summary_node_embeddings` as vector BLOB + norm metadata.
   - semantic search prefers dense Jina embeddings and falls back to sparse SQL
     cosine-style matching when dense embeddings are unavailable.
+  - sparse semantic and lexical ranking both apply query-term-coverage weighting
+    so nodes matching more distinct query concepts rank ahead of single-token hits.
+  - lexical command matches boost failed commands (`exit_code != 0`) to surface
+    higher-signal failure memories earlier.
   - hybrid search combines semantic score and lexical score from file/command/error/title
     matches into a final rank score.
 

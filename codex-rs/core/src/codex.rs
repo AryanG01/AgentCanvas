@@ -561,6 +561,12 @@ impl Codex {
         self.session.state_db()
     }
 
+    pub(crate) async fn take_rollout_summary_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        self.session.take_rollout_summary_receiver().await
+    }
+
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
@@ -1604,6 +1610,16 @@ impl Session {
 
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.services.state_db.clone()
+    }
+
+    pub(crate) async fn take_rollout_summary_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        let recorder = {
+            let guard = self.services.rollout.lock().await;
+            guard.clone()
+        };
+        recorder.and_then(|recorder| recorder.summary_receiver())
     }
 
     /// Ensure all rollout writes are durably flushed.

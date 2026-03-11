@@ -134,6 +134,12 @@ impl CodexThread {
         self.codex.state_db()
     }
 
+    pub async fn take_rollout_summary_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>> {
+        self.codex.take_rollout_summary_receiver().await
+    }
+
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.codex.thread_config_snapshot().await
     }

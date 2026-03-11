@@ -9,7 +9,7 @@ export const SessionNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
     <div
       className={`
         w-[260px] rounded-2xl border-2 px-4 py-2.5 shadow-2xl
-        bg-gradient-to-r from-indigo-950 to-zinc-900 text-white
+        bg-gradient-to-br from-indigo-950 to-zinc-900 text-white
         ${selected ? 'border-indigo-300' : 'border-indigo-700/60'}
       `}
     >
@@ -30,7 +30,7 @@ export const SessionNode = memo(({ data, selected }: NodeProps<GraphNode>) => {
       </div>
       <Handle
         type="source"
-        position={Position.Bottom}
+        position={Position.Right}
         className="!bg-indigo-500 !border-indigo-400 !w-2 !h-2"
       />
     </div>

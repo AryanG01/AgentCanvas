@@ -77,10 +77,12 @@ export interface SummaryNodeEvent {
   type: 'SummaryNode'
   id: string
   turnId: string
+  nodeType: 'turn' | 'phase'
   status: string
   summaryText: string
   brief: {
     signal: string
+    shortSummary: string | null
     agentMessage: string | null
     primaryCommand: string | null
     primaryFilePath: string | null
@@ -104,11 +106,14 @@ export interface SummaryNodeEvent {
   }
   lineage: {
     parentTurnId: string | null
+    childTurnId: string | null
+    childTurnIds: string[]
     forkedFromThreadId: string | null
     startedAfterRollback: boolean
     wasRolledBack: boolean
   }
   evidence: {
+    childTurnIds: string[]
     filePaths: string[]
     commands: Array<{ command: string; exitCode: number | null }>
     errors: string[]
@@ -139,7 +144,7 @@ export type AppEvent =
 // Graph node types
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error' | 'summary'
+export type NodeKind = 'session' | 'turn' | 'command' | 'tool' | 'patch' | 'plan' | 'error' | 'summary' | 'phase'
 
 export interface GraphNodeData extends Record<string, unknown> {
   kind: NodeKind
@@ -150,7 +155,6 @@ export interface GraphNodeData extends Record<string, unknown> {
   collapsed?: boolean
   itemCount?: number  // number of child items (for turn nodes)
   aggregatedCommands?: CommandExecutionEvent[]  // for command summary nodes
-  [key: string]: unknown  // Index signature for @xyflow/react compatibility
 }
 
 // ---------------------------------------------------------------------------
@@ -169,4 +173,5 @@ export interface SessionInfo {
   cwd: string
   file: string
   id: string
+  title?: string | null
 }

@@ -1,3 +1,4 @@
+import React from 'react'
 import { useGraphStore } from '../store/graphStore'
 import type {
   CommandExecutionEvent,
@@ -27,11 +28,12 @@ export function EvidencePanel() {
     plan:    'text-zinc-400',
     error:   'text-red-400',
     summary: 'text-fuchsia-400',
+    phase:   'text-violet-400',
   }
 
   const kindLabels: Record<string, string> = {
     turn: 'TURN', command: 'CMD', tool: 'MCP TOOL',
-    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR', summary: 'SUMMARY',
+    patch: 'FILE PATCH', plan: 'PLAN', error: 'ERROR', summary: 'SUMMARY', phase: 'PHASE',
   }
 
   return (
@@ -64,6 +66,8 @@ export function EvidencePanel() {
           <PatchDetail event={rawEvent as PatchApplyEvent} />
         ) : kind === 'plan' ? (
           <PlanDetail event={rawEvent as PlanUpdateEvent} />
+        ) : kind === 'phase' ? (
+          <PhaseDetail event={rawEvent as SummaryNodeEvent} />
         ) : kind === 'summary' ? (
           <SummaryDetail event={rawEvent as SummaryNodeEvent} />
         ) : kind === 'turn' ? (
@@ -222,45 +226,218 @@ function TurnDetail({ event }: { event: TurnStartedEvent }) {
   )
 }
 
+function ActivityStats({ event }: { event: SummaryNodeEvent }) {
+  const { commandsTotal, filePathsTotal, errorsTotal } = event.counts
+  const hasErrors = errorsTotal > 0
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {commandsTotal > 0 && (
+        <span className={`inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded ${hasErrors ? 'bg-yellow-900/40 text-yellow-300 border border-yellow-700/30' : 'bg-green-900/40 text-green-300 border border-green-700/30'}`}>
+          ⌘ {commandsTotal}
+        </span>
+      )}
+      {filePathsTotal > 0 && (
+        <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-green-900/40 text-green-300 border border-green-700/30">
+          ◇ {filePathsTotal} file{filePathsTotal !== 1 ? 's' : ''}
+        </span>
+      )}
+      {errorsTotal > 0 && (
+        <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-900/40 text-red-300 border border-red-700/30">
+          ✕ {errorsTotal} error{errorsTotal !== 1 ? 's' : ''}
+        </span>
+      )}
+      <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-fuchsia-900/30 text-fuchsia-300 border border-fuchsia-700/30">
+        {event.brief.signal}
+      </span>
+    </div>
+  )
+}
+
+function CommandList({ commands }: { commands: Array<{ command: string; exitCode: number | null }> }) {
+  const [expanded, setExpanded] = React.useState(false)
+  const visible = expanded ? commands : commands.slice(0, 5)
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-2.5 space-y-1">
+      {visible.map((cmd, i) => {
+        const ok = cmd.exitCode === 0 || cmd.exitCode === null
+        return (
+          <div key={i} className="flex items-center gap-2 text-xs font-mono py-0.5">
+            <span className="text-zinc-500 select-none">$</span>
+            <span className="flex-1 text-yellow-300 truncate">{cmd.command}</span>
+            <span className={`flex-shrink-0 h-1.5 w-1.5 rounded-full ${ok ? 'bg-green-400' : 'bg-red-400'}`} />
+          </div>
+        )
+      })}
+      {commands.length > 5 && !expanded && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="text-[10px] text-zinc-500 hover:text-zinc-300 pt-1"
+        >
+          +{commands.length - 5} more…
+        </button>
+      )}
+    </div>
+  )
+}
+
+function CompactLineage({ lineage }: { lineage: SummaryNodeEvent['lineage'] }) {
+  const parts: string[] = []
+  if (lineage.parentTurnId) parts.push(`↑ ${lineage.parentTurnId}`)
+  if (lineage.childTurnId) parts.push(`→ ${lineage.childTurnId}`)
+  if (lineage.forkedFromThreadId) parts.push(`⑂ ${lineage.forkedFromThreadId}`)
+  if (lineage.startedAfterRollback) parts.push('↺ rollback')
+  if (lineage.wasRolledBack) parts.push('⊘ rolled back')
+  if (parts.length === 0) return null
+  return (
+    <Section title="Lineage">
+      <span className="text-xs font-mono text-zinc-400">{parts.join('  ')}</span>
+    </Section>
+  )
+}
+
 function SummaryDetail({ event }: { event: SummaryNodeEvent }) {
+  const [showAgent, setShowAgent] = React.useState(false)
+  const summaryText = event.summaryText?.trim()
+  const agentMsg = event.brief.agentMessage?.trim()
+  const commands = event.evidence.commands ?? []
+  const filePaths = event.evidence.filePaths ?? []
+  const errors = event.evidence.errors ?? []
+
   return (
     <>
-      <Section title="Summary">
-        <CodeBlock className="text-fuchsia-200">{event.summaryText || '(empty)'}</CodeBlock>
+      {/* Summary prose */}
+      {summaryText && (
+        <Section title="Summary">
+          <p className="text-sm text-fuchsia-200 leading-relaxed">{summaryText}</p>
+        </Section>
+      )}
+
+      {/* Activity stats */}
+      <Section title="Activity">
+        <ActivityStats event={event} />
       </Section>
 
-      <Section title="Signal">
-        <span className="inline-flex items-center gap-1 text-xs font-mono bg-fuchsia-900/40 text-fuchsia-200 px-2 py-0.5 rounded border border-fuchsia-700/30">
-          {event.brief.signal}
-        </span>
+      {/* Commands */}
+      {commands.length > 0 && (
+        <Section title="Commands">
+          <CommandList commands={commands} />
+        </Section>
+      )}
+
+      {/* Files */}
+      {filePaths.length > 0 && (
+        <Section title="Files">
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-2.5 space-y-1">
+            {filePaths.map((fp, i) => (
+              <div key={i} className="text-xs font-mono text-green-300 truncate py-0.5">{fp}</div>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {/* Errors */}
+      {errors.length > 0 && (
+        <Section title="Errors">
+          <div className="space-y-1">
+            {errors.map((err, i) => (
+              <div key={i} className="text-xs font-mono text-red-300 bg-red-900/20 rounded px-2 py-1 border border-red-800/30">
+                {err}
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {/* Agent message (collapsible) */}
+      {agentMsg && (
+        <div>
+          <button
+            onClick={() => setShowAgent(!showAgent)}
+            className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1 hover:text-zinc-300 flex items-center gap-1"
+          >
+            <span className="text-[8px]">{showAgent ? '▼' : '▶'}</span>
+            Agent Message
+          </button>
+          {showAgent && (
+            <p className="text-xs text-zinc-400 leading-relaxed bg-zinc-900 rounded-lg p-3 border border-zinc-800">
+              {agentMsg}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Lineage */}
+      <CompactLineage lineage={event.lineage} />
+    </>
+  )
+}
+
+function PhaseDetail({ event }: { event: SummaryNodeEvent }) {
+  const selectNode = useGraphStore(s => s.selectNode)
+  const nodes = useGraphStore(s => s.nodes)
+  const childTurnIds = event.lineage.childTurnIds.length > 0
+    ? event.lineage.childTurnIds
+    : event.evidence.childTurnIds
+  const summaryText = event.summaryText?.trim()
+  const errors = event.evidence.errors ?? []
+
+  return (
+    <>
+      {/* Phase summary prose */}
+      {summaryText && (
+        <Section title="Phase Summary">
+          <p className="text-sm text-violet-200 leading-relaxed">{summaryText}</p>
+        </Section>
+      )}
+
+      {/* Aggregated stats */}
+      <Section title="Activity">
+        <ActivityStats event={event} />
       </Section>
 
-      <Section title="Brief">
-        <CodeBlock>
-{JSON.stringify({
-  agentMessage: event.brief.agentMessage,
-  primaryCommand: event.brief.primaryCommand,
-  primaryFilePath: event.brief.primaryFilePath,
-  primaryError: event.brief.primaryError,
-}, null, 2)}
-        </CodeBlock>
-      </Section>
+      {/* Turn list */}
+      {childTurnIds.length > 0 && (
+        <Section title={`${childTurnIds.length} Turn${childTurnIds.length !== 1 ? 's' : ''}`}>
+          <div className="space-y-1.5">
+            {childTurnIds.map((turnId) => {
+              const turnNode = nodes.find(n => n.id === `turn-${turnId}`)
+              const summaryNode = nodes.find(n => n.id === `summary-${turnId}`)
+              const label = summaryNode?.data.label ?? turnNode?.data.label ?? turnId
+              return (
+                <button
+                  key={turnId}
+                  onClick={() => selectNode(`turn-${turnId}`)}
+                  className="w-full text-left rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 hover:border-zinc-600 transition-colors"
+                >
+                  <div className="flex items-center justify-between mb-0.5">
+                    <span className="text-[10px] font-mono text-zinc-500">{turnId}</span>
+                    <span className={`text-[10px] font-mono ${turnNode?.data.status === 'error' ? 'text-red-400' : 'text-green-400'}`}>
+                      {turnNode?.data.status ?? 'unknown'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-zinc-200 truncate">{label}</p>
+                </button>
+              )
+            })}
+          </div>
+        </Section>
+      )}
 
-      <Section title="Counts">
-        <CodeBlock>{JSON.stringify(event.counts, null, 2)}</CodeBlock>
-      </Section>
+      {/* Errors */}
+      {errors.length > 0 && (
+        <Section title="Errors">
+          <div className="space-y-1">
+            {errors.map((err, i) => (
+              <div key={i} className="text-xs font-mono text-red-300 bg-red-900/20 rounded px-2 py-1 border border-red-800/30">
+                {err}
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
 
-      <Section title="Digest">
-        <CodeBlock>{JSON.stringify(event.digest, null, 2)}</CodeBlock>
-      </Section>
-
-      <Section title="Lineage">
-        <CodeBlock>{JSON.stringify(event.lineage, null, 2)}</CodeBlock>
-      </Section>
-
-      <Section title="Evidence">
-        <CodeBlock>{JSON.stringify(event.evidence, null, 2)}</CodeBlock>
-      </Section>
+      {/* Lineage */}
+      <CompactLineage lineage={event.lineage} />
     </>
   )
 }

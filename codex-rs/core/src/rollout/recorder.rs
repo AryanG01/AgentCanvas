@@ -23,6 +23,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
+use tokio::time::Duration;
+use tokio::time::Instant;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -42,7 +44,9 @@ use super::list::parse_timestamp_uuid_from_filename;
 use super::metadata;
 use super::policy::EventPersistenceMode;
 use super::policy::is_persisted_response_item;
+use super::turn_summary_llm::LlmSummaryResult;
 use super::turn_summary_llm::TurnSummaryEvidence;
+use super::turn_summary_llm::TurnSummarySnapshot;
 use super::turn_summary_llm::generate_turn_summaries;
 use crate::config::Config;
 use crate::default_client::originator;
@@ -80,6 +84,7 @@ pub struct RolloutRecorder {
     pub(crate) rollout_path: PathBuf,
     state_db: Option<StateDbHandle>,
     event_persistence_mode: EventPersistenceMode,
+    summary_rx: std::sync::Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<Value>>>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +147,8 @@ impl RolloutRecorderParams {
 const PERSISTED_EXEC_AGGREGATED_OUTPUT_MAX_BYTES: usize = 10_000;
 const AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION: &str = "agentcanvas.turn.v2";
 const AGENTCANVAS_TURN_SUMMARY_KIND: &str = "agentcanvas_turn_summary";
+const AGENTCANVAS_PHASE_SUMMARY_SCHEMA_VERSION: &str = "agentcanvas.phase.v1";
+const AGENTCANVAS_PHASE_SUMMARY_KIND: &str = "agentcanvas_phase_summary";
 const SUMMARY_MAX_AGENT_MESSAGE_BYTES: usize = 480;
 const SUMMARY_MAX_COMMAND_TEXT_BYTES: usize = 320;
 const SUMMARY_MAX_FILE_PATH_TEXT_BYTES: usize = 280;
@@ -150,6 +157,8 @@ const SUMMARY_MAX_COMMAND_ITEMS: usize = 30;
 const SUMMARY_MAX_FILE_PATH_ITEMS: usize = 40;
 const SUMMARY_MAX_ERROR_ITEMS: usize = 20;
 const SUMMARY_DIGEST_ITEMS: usize = 5;
+const SUMMARY_PROGRESSIVE_FILE_TRIGGER_COUNT: usize = 3;
+const SUMMARY_PROGRESSIVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
 struct AgentCanvasCommandEvidence {
@@ -165,6 +174,9 @@ struct PendingAgentCanvasTurnSummary {
     commands: BTreeSet<AgentCanvasCommandEvidence>,
     file_paths: BTreeSet<String>,
     errors: BTreeSet<String>,
+    evidence_changed_since_last_emit: bool,
+    last_progressive_emit: Option<Instant>,
+    file_threshold_emit_triggered: bool,
 }
 
 impl PendingAgentCanvasTurnSummary {
@@ -176,6 +188,27 @@ impl PendingAgentCanvasTurnSummary {
             commands: BTreeSet::new(),
             file_paths: BTreeSet::new(),
             errors: BTreeSet::new(),
+            evidence_changed_since_last_emit: false,
+            last_progressive_emit: Some(Instant::now()),
+            file_threshold_emit_triggered: false,
+        }
+    }
+
+    fn record_command(&mut self, command: AgentCanvasCommandEvidence) {
+        if self.commands.insert(command) {
+            self.evidence_changed_since_last_emit = true;
+        }
+    }
+
+    fn record_file_path(&mut self, file_path: String) {
+        if self.file_paths.insert(file_path) {
+            self.evidence_changed_since_last_emit = true;
+        }
+    }
+
+    fn record_error(&mut self, error: String) {
+        if self.errors.insert(error) {
+            self.evidence_changed_since_last_emit = true;
         }
     }
 }
@@ -193,18 +226,286 @@ struct CompletedAgentCanvasTurnSummary {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ProgressiveAgentCanvasTurnSummary {
+    turn_id: String,
+    parent_turn_id: Option<String>,
+    forked_from_thread_id: Option<String>,
+    started_after_rollback: bool,
+    commands: Vec<AgentCanvasCommandEvidence>,
+    file_paths: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PhaseSummaryCandidate {
+    phase_id: String,
+    parent_phase_id: Option<String>,
+    child_turn_ids: Vec<String>,
+    parent_turn_id: Option<String>,
+    status: String,
+    signal: String,
+    command_digest: Vec<String>,
+    file_path_digest: Vec<String>,
+    error_digest: Vec<String>,
+    commands: Vec<AgentCanvasCommandEvidence>,
+    file_paths: Vec<String>,
+    errors: Vec<String>,
+    total_command_count: usize,
+    total_file_path_count: usize,
+    total_error_count: usize,
+    omitted_command_count: usize,
+    omitted_file_path_count: usize,
+    omitted_error_count: usize,
+    compact_summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedTurnSummary {
+    turn_id: String,
+    status: String,
+    parent_turn_id: Option<String>,
+    child_turn_id: Option<String>,
+    forked_from_thread_id: Option<String>,
+    started_after_rollback: bool,
+    node_id: String,
+    parent_node_id: Option<String>,
+    signal: String,
+    agent_message: Option<String>,
+    command_digest: Vec<String>,
+    file_path_digest: Vec<String>,
+    error_digest: Vec<String>,
+    commands: Vec<AgentCanvasCommandEvidence>,
+    file_paths: Vec<String>,
+    errors: Vec<String>,
+    total_command_count: usize,
+    total_file_path_count: usize,
+    total_error_count: usize,
+    omitted_command_count: usize,
+    omitted_file_path_count: usize,
+    omitted_error_count: usize,
+    compact_summary: String,
+}
+
 #[derive(Default)]
 struct AgentCanvasSummaryUpdates {
+    progressive_turn_summaries: Vec<ProgressiveAgentCanvasTurnSummary>,
     completed_turn_summaries: Vec<CompletedAgentCanvasTurnSummary>,
+    phase_summaries: Vec<PhaseSummaryCandidate>,
     rolled_back_turn_ids: Vec<String>,
 }
 
 impl AgentCanvasSummaryUpdates {
     fn append(&mut self, mut other: Self) {
+        self.progressive_turn_summaries
+            .append(&mut other.progressive_turn_summaries);
         self.completed_turn_summaries
             .append(&mut other.completed_turn_summaries);
+        self.phase_summaries.append(&mut other.phase_summaries);
         self.rolled_back_turn_ids
             .append(&mut other.rolled_back_turn_ids);
+    }
+}
+
+#[derive(Debug)]
+struct ActivePhase {
+    phase_id: String,
+    parent_phase_id: Option<String>,
+    child_turn_ids: Vec<String>,
+    parent_turn_id: Option<String>,
+    commands: BTreeSet<AgentCanvasCommandEvidence>,
+    file_paths: BTreeSet<String>,
+    errors: BTreeSet<String>,
+    has_error_turn: bool,
+}
+
+impl ActivePhase {
+    fn new(
+        phase_id: String,
+        parent_phase_id: Option<String>,
+        turn_summary: &CompletedAgentCanvasTurnSummary,
+    ) -> Self {
+        let mut commands = BTreeSet::new();
+        commands.extend(turn_summary.commands.iter().cloned());
+        let mut file_paths = BTreeSet::new();
+        file_paths.extend(turn_summary.file_paths.iter().cloned());
+        let mut errors = BTreeSet::new();
+        errors.extend(turn_summary.errors.iter().cloned());
+        Self {
+            phase_id,
+            parent_phase_id,
+            child_turn_ids: vec![turn_summary.turn_id.clone()],
+            parent_turn_id: turn_summary.parent_turn_id.clone(),
+            commands,
+            file_paths,
+            errors,
+            has_error_turn: !turn_summary.errors.is_empty(),
+        }
+    }
+
+    fn absorb_turn(&mut self, turn_summary: &CompletedAgentCanvasTurnSummary) {
+        self.child_turn_ids.push(turn_summary.turn_id.clone());
+        self.commands.extend(turn_summary.commands.iter().cloned());
+        self.file_paths
+            .extend(turn_summary.file_paths.iter().cloned());
+        self.errors.extend(turn_summary.errors.iter().cloned());
+        if !turn_summary.errors.is_empty() {
+            self.has_error_turn = true;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PhaseAccumulator {
+    active_phase: Option<ActivePhase>,
+    next_phase_index: u64,
+    last_emitted_phase_id: Option<String>,
+}
+
+impl PhaseAccumulator {
+    fn observe_completed_turn(
+        &mut self,
+        turn_summary: &CompletedAgentCanvasTurnSummary,
+    ) -> Vec<PhaseSummaryCandidate> {
+        let mut emitted = Vec::new();
+        if self
+            .active_phase
+            .as_ref()
+            .is_some_and(|active| Self::topic_shift(active, turn_summary))
+            && let Some(candidate) = self.emit_active_phase()
+        {
+            emitted.push(candidate);
+        }
+
+        if self.active_phase.is_none() {
+            let phase_id = format!("phase-{}", self.next_phase_index);
+            self.next_phase_index = self.next_phase_index.saturating_add(1);
+            self.active_phase = Some(ActivePhase::new(
+                phase_id,
+                self.last_emitted_phase_id.clone(),
+                turn_summary,
+            ));
+        } else if let Some(active_phase) = self.active_phase.as_mut() {
+            active_phase.absorb_turn(turn_summary);
+        }
+
+        if let Some(active_phase) = self.active_phase.as_ref()
+            && active_phase.has_error_turn
+            && turn_summary.errors.is_empty()
+            && let Some(candidate) = self.emit_active_phase()
+        {
+            emitted.push(candidate);
+        }
+
+        emitted
+    }
+
+    fn rollback_turns(&mut self, rolled_back_turn_ids: &[String]) {
+        let Some(active_phase) = self.active_phase.as_mut() else {
+            return;
+        };
+        if rolled_back_turn_ids.is_empty() {
+            return;
+        }
+        let rolled_back: BTreeSet<&str> = rolled_back_turn_ids.iter().map(String::as_str).collect();
+        active_phase
+            .child_turn_ids
+            .retain(|turn_id| !rolled_back.contains(turn_id.as_str()));
+        if active_phase.child_turn_ids.is_empty() {
+            self.active_phase = None;
+        }
+    }
+
+    fn topic_shift(
+        active_phase: &ActivePhase,
+        turn_summary: &CompletedAgentCanvasTurnSummary,
+    ) -> bool {
+        if active_phase.file_paths.is_empty() && turn_summary.file_paths.is_empty() {
+            return false;
+        }
+        let incoming_file_paths: BTreeSet<&str> =
+            turn_summary.file_paths.iter().map(String::as_str).collect();
+        let active_file_paths: BTreeSet<&str> =
+            active_phase.file_paths.iter().map(String::as_str).collect();
+        let intersection = active_file_paths.intersection(&incoming_file_paths).count();
+        let union = active_file_paths.union(&incoming_file_paths).count();
+        if union == 0 {
+            return false;
+        }
+        (intersection as f64) / (union as f64) < 0.3
+    }
+
+    fn emit_active_phase(&mut self) -> Option<PhaseSummaryCandidate> {
+        let active_phase = self.active_phase.take()?;
+        if active_phase.child_turn_ids.is_empty() {
+            return None;
+        }
+        let commands: Vec<AgentCanvasCommandEvidence> = active_phase.commands.into_iter().collect();
+        let file_paths: Vec<String> = active_phase.file_paths.into_iter().collect();
+        let errors: Vec<String> = active_phase.errors.into_iter().collect();
+        let (commands, total_command_count, omitted_command_count) =
+            compact_command_evidence(commands);
+        let (file_paths, total_file_path_count, omitted_file_path_count) = compact_string_evidence(
+            file_paths,
+            SUMMARY_MAX_FILE_PATH_ITEMS,
+            SUMMARY_MAX_FILE_PATH_TEXT_BYTES,
+        );
+        let (errors, total_error_count, omitted_error_count) = compact_string_evidence(
+            errors,
+            SUMMARY_MAX_ERROR_ITEMS,
+            SUMMARY_MAX_ERROR_TEXT_BYTES,
+        );
+        let command_digest = build_digest_commands(commands.as_slice());
+        let file_path_digest = build_digest_strings(file_paths.as_slice());
+        let error_digest = build_digest_strings(errors.as_slice());
+        let signal = classify_turn_signal(
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+        )
+        .to_string();
+        let summary_status = if total_error_count > 0 {
+            "error"
+        } else {
+            "completed"
+        };
+        let compact_summary = build_compact_turn_summary(
+            summary_status,
+            signal.as_str(),
+            active_phase.parent_turn_id.as_deref(),
+            active_phase.child_turn_ids.last().map(String::as_str),
+            None,
+            false,
+            None,
+            command_digest.as_slice(),
+            file_path_digest.as_slice(),
+            error_digest.as_slice(),
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+        );
+        self.last_emitted_phase_id = Some(active_phase.phase_id.clone());
+        Some(PhaseSummaryCandidate {
+            phase_id: active_phase.phase_id,
+            parent_phase_id: active_phase.parent_phase_id,
+            child_turn_ids: active_phase.child_turn_ids,
+            parent_turn_id: active_phase.parent_turn_id,
+            status: summary_status.to_string(),
+            signal,
+            command_digest,
+            file_path_digest,
+            error_digest,
+            commands,
+            file_paths,
+            errors,
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+            omitted_command_count,
+            omitted_file_path_count,
+            omitted_error_count,
+            compact_summary,
+        })
     }
 }
 
@@ -215,6 +516,7 @@ struct AgentCanvasSummaryAccumulator {
     pending_turn: Option<PendingAgentCanvasTurnSummary>,
     active_turn_lineage: Vec<String>,
     rollback_since_last_turn: bool,
+    phase_accumulator: PhaseAccumulator,
 }
 
 impl AgentCanvasSummaryAccumulator {
@@ -252,7 +554,7 @@ impl AgentCanvasSummaryAccumulator {
     }
 
     fn handle_rollout_item(&mut self, item: &RolloutItem) -> AgentCanvasSummaryUpdates {
-        match item {
+        let mut updates = match item {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::ResponseItem(item) => {
                 self.handle_response_item(item);
@@ -265,7 +567,11 @@ impl AgentCanvasSummaryAccumulator {
             RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) => {
                 AgentCanvasSummaryUpdates::default()
             }
+        };
+        if let Some(progressive) = self.check_progressive_trigger(item) {
+            updates.progressive_turn_summaries.push(progressive);
         }
+        updates
     }
 
     fn handle_event(
@@ -291,6 +597,12 @@ impl AgentCanvasSummaryAccumulator {
                 );
                 self.push_active_turn(completed.turn_id.clone());
                 updates.completed_turn_summaries.push(completed);
+                if let Some(completed_turn) = updates.completed_turn_summaries.last() {
+                    updates.phase_summaries.extend(
+                        self.phase_accumulator
+                            .observe_completed_turn(completed_turn),
+                    );
+                }
             }
             codex_protocol::protocol::EventMsg::TurnAborted(event) => {
                 let Some(turn_id) = event.turn_id.clone().or_else(|| {
@@ -308,11 +620,19 @@ impl AgentCanvasSummaryAccumulator {
                 updates
                     .completed_turn_summaries
                     .push(self.complete_turn_summary(turn_id.as_str(), status, None));
+                if let Some(completed_turn) = updates.completed_turn_summaries.last() {
+                    updates.phase_summaries.extend(
+                        self.phase_accumulator
+                            .observe_completed_turn(completed_turn),
+                    );
+                }
             }
             codex_protocol::protocol::EventMsg::ThreadRolledBack(event) => {
                 updates.rolled_back_turn_ids = self.rollback_active_turns(event.num_turns);
                 if !updates.rolled_back_turn_ids.is_empty() {
                     self.rollback_since_last_turn = true;
+                    self.phase_accumulator
+                        .rollback_turns(updates.rolled_back_turn_ids.as_slice());
                 }
             }
             codex_protocol::protocol::EventMsg::ExecCommandEnd(event) => {
@@ -322,7 +642,7 @@ impl AgentCanvasSummaryAccumulator {
                     Some(event.turn_id.as_str())
                 };
                 if let Some(pending) = self.pending_turn_for(turn_id) {
-                    pending.commands.insert(AgentCanvasCommandEvidence {
+                    pending.record_command(AgentCanvasCommandEvidence {
                         command: event.command.join(" "),
                         exit_code: Some(i64::from(event.exit_code)),
                     });
@@ -333,11 +653,9 @@ impl AgentCanvasSummaryAccumulator {
                         )
                     {
                         if !event.stderr.trim().is_empty() {
-                            pending.errors.insert(event.stderr.trim().to_string());
+                            pending.record_error(event.stderr.trim().to_string());
                         } else if !event.aggregated_output.trim().is_empty() {
-                            pending
-                                .errors
-                                .insert(event.aggregated_output.trim().to_string());
+                            pending.record_error(event.aggregated_output.trim().to_string());
                         }
                     }
                 }
@@ -350,29 +668,25 @@ impl AgentCanvasSummaryAccumulator {
                 };
                 if let Some(pending) = self.pending_turn_for(turn_id) {
                     for path in event.changes.keys() {
-                        pending
-                            .file_paths
-                            .insert(path.to_string_lossy().into_owned());
+                        pending.record_file_path(path.to_string_lossy().into_owned());
                     }
                     if !event.success {
                         if !event.stderr.trim().is_empty() {
-                            pending.errors.insert(event.stderr.trim().to_string());
+                            pending.record_error(event.stderr.trim().to_string());
                         } else if !event.stdout.trim().is_empty() {
-                            pending.errors.insert(event.stdout.trim().to_string());
+                            pending.record_error(event.stdout.trim().to_string());
                         }
                     }
                 }
             }
             codex_protocol::protocol::EventMsg::Error(event) => {
                 if let Some(pending) = self.pending_turn_for(None) {
-                    pending.errors.insert(event.message.clone());
+                    pending.record_error(event.message.clone());
                 }
             }
             codex_protocol::protocol::EventMsg::ViewImageToolCall(event) => {
                 if let Some(pending) = self.pending_turn_for(None) {
-                    pending
-                        .file_paths
-                        .insert(event.path.to_string_lossy().into_owned());
+                    pending.record_file_path(event.path.to_string_lossy().into_owned());
                 }
             }
             _ => {}
@@ -387,7 +701,7 @@ impl AgentCanvasSummaryAccumulator {
         match item {
             ResponseItem::LocalShellCall { action, .. } => {
                 let LocalShellAction::Exec(exec) = action;
-                pending.commands.insert(AgentCanvasCommandEvidence {
+                pending.record_command(AgentCanvasCommandEvidence {
                     command: exec.command.join(" "),
                     exit_code: None,
                 });
@@ -395,13 +709,13 @@ impl AgentCanvasSummaryAccumulator {
             ResponseItem::FunctionCall {
                 name, arguments, ..
             } => {
-                collect_apply_patch_paths(
-                    name.as_str(),
-                    arguments.as_str(),
-                    &mut pending.file_paths,
-                );
+                let mut extracted_paths = BTreeSet::new();
+                collect_apply_patch_paths(name.as_str(), arguments.as_str(), &mut extracted_paths);
+                for file_path in extracted_paths {
+                    pending.record_file_path(file_path);
+                }
                 if let Some(command) = extract_command_from_json(arguments.as_str()) {
-                    pending.commands.insert(AgentCanvasCommandEvidence {
+                    pending.record_command(AgentCanvasCommandEvidence {
                         command,
                         exit_code: None,
                     });
@@ -414,14 +728,18 @@ impl AgentCanvasSummaryAccumulator {
                 {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
-                        pending.errors.insert(trimmed.to_string());
+                        pending.record_error(trimmed.to_string());
                     }
                 }
             }
             ResponseItem::CustomToolCall { name, input, .. } => {
-                collect_apply_patch_paths(name.as_str(), input.as_str(), &mut pending.file_paths);
+                let mut extracted_paths = BTreeSet::new();
+                collect_apply_patch_paths(name.as_str(), input.as_str(), &mut extracted_paths);
+                for file_path in extracted_paths {
+                    pending.record_file_path(file_path);
+                }
                 if let Some(command) = extract_command_from_json(input.as_str()) {
-                    pending.commands.insert(AgentCanvasCommandEvidence {
+                    pending.record_command(AgentCanvasCommandEvidence {
                         command,
                         exit_code: None,
                     });
@@ -444,6 +762,46 @@ impl AgentCanvasSummaryAccumulator {
             (Some(pending), Some(turn_id)) if pending.turn_id != turn_id => None,
             _ => self.pending_turn.as_mut(),
         }
+    }
+
+    fn check_progressive_trigger(
+        &mut self,
+        item: &RolloutItem,
+    ) -> Option<ProgressiveAgentCanvasTurnSummary> {
+        let pending = self.pending_turn.as_mut()?;
+        let command_failed = matches!(
+            item,
+            RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ExecCommandEnd(event))
+                if event.exit_code != 0
+                    || !matches!(
+                        event.status,
+                        codex_protocol::protocol::ExecCommandStatus::Completed
+                    )
+        );
+        let file_threshold_crossed = pending.file_paths.len()
+            >= SUMMARY_PROGRESSIVE_FILE_TRIGGER_COUNT
+            && !pending.file_threshold_emit_triggered;
+        let debounce_expired = pending.evidence_changed_since_last_emit
+            && pending
+                .last_progressive_emit
+                .is_some_and(|last_emit| last_emit.elapsed() >= SUMMARY_PROGRESSIVE_DEBOUNCE);
+        if !command_failed && !file_threshold_crossed && !debounce_expired {
+            return None;
+        }
+        if file_threshold_crossed {
+            pending.file_threshold_emit_triggered = true;
+        }
+        pending.evidence_changed_since_last_emit = false;
+        pending.last_progressive_emit = Some(Instant::now());
+        Some(ProgressiveAgentCanvasTurnSummary {
+            turn_id: pending.turn_id.clone(),
+            parent_turn_id: pending.parent_turn_id.clone(),
+            forked_from_thread_id: self.forked_from_thread_id.clone(),
+            started_after_rollback: pending.started_after_rollback,
+            commands: pending.commands.iter().cloned().collect(),
+            file_paths: pending.file_paths.iter().cloned().collect(),
+            errors: pending.errors.iter().cloned().collect(),
+        })
     }
 
     fn complete_turn_summary(
@@ -558,9 +916,11 @@ fn classify_turn_signal(
 
 fn build_compact_turn_summary(
     status: &str,
-    signal: &str,
-    parent_turn_id: Option<&str>,
-    child_turn_id: Option<&str>,
+    _signal: &str,
+    _parent_turn_id: Option<&str>,
+    _child_turn_id: Option<&str>,
+    _forked_from_thread_id: Option<&str>,
+    _started_after_rollback: bool,
     agent_message: Option<&str>,
     command_digest: &[String],
     file_path_digest: &[String],
@@ -569,38 +929,85 @@ fn build_compact_turn_summary(
     total_file_path_count: usize,
     total_error_count: usize,
 ) -> String {
-    let mut parts = vec![format!("status={status}"), format!("signal={signal}")];
-    if total_command_count > 0 {
-        parts.push(format!("commands_total={total_command_count}"));
-    }
-    if total_file_path_count > 0 {
-        parts.push(format!("file_paths_total={total_file_path_count}"));
-    }
+    let mut parts = Vec::new();
+
+    // Lead with action verb + specifics
     if total_error_count > 0 {
-        parts.push(format!("errors_total={total_error_count}"));
+        let cmd_examples = command_digest
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if cmd_examples.is_empty() {
+            String::new()
+        } else {
+            format!(" ({cmd_examples})")
+        };
+        parts.push(format!(
+            "Failed {total_error_count} command{}{suffix}",
+            if total_error_count != 1 { "s" } else { "" }
+        ));
+    } else if total_file_path_count > 0 && total_command_count > 0 {
+        let file_examples = file_path_digest
+            .iter()
+            .take(2)
+            .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cmd_examples = command_digest
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Edited {total_file_path_count} file{} ({file_examples}), ran {total_command_count} command{} ({cmd_examples})",
+            if total_file_path_count != 1 { "s" } else { "" },
+            if total_command_count != 1 { "s" } else { "" }
+        ));
+    } else if total_file_path_count > 0 {
+        let file_examples = file_path_digest
+            .iter()
+            .take(3)
+            .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Edited {total_file_path_count} file{} ({file_examples})",
+            if total_file_path_count != 1 { "s" } else { "" }
+        ));
+    } else if total_command_count > 0 {
+        let cmd_examples = command_digest
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Ran {total_command_count} command{} ({cmd_examples})",
+            if total_command_count != 1 { "s" } else { "" }
+        ));
+    } else if status == "completed" {
+        parts.push("Completed".to_string());
+    } else {
+        parts.push(format!("Status: {status}"));
     }
-    if let Some(parent_turn_id) = parent_turn_id {
-        parts.push(format!("parent_turn={parent_turn_id}"));
+
+    // Add agent message snippet
+    if let Some(msg) = agent_message {
+        let snippet: String = msg.chars().take(100).collect();
+        parts.push(snippet);
     }
-    if let Some(child_turn_id) = child_turn_id {
-        parts.push(format!("child_turn={child_turn_id}"));
-    }
-    if let Some(command) = command_digest.first() {
-        parts.push(format!("primary_command={command}"));
-    }
-    if let Some(file_path) = file_path_digest.first() {
-        parts.push(format!("primary_file_path={file_path}"));
-    }
-    if let Some(error) = error_digest.first() {
-        parts.push(format!("primary_error={error}"));
-    }
-    if let Some(agent_message) = agent_message {
-        parts.push(format!("agent_message={agent_message}"));
-    }
+
     truncate_text(
-        parts.join("; ").as_str(),
+        parts.join(". ").as_str(),
         TruncationPolicy::Bytes(SUMMARY_MAX_AGENT_MESSAGE_BYTES),
     )
+}
+
+fn is_structured_turn_summary(summary: &str) -> bool {
+    !summary.trim().is_empty()
 }
 
 fn compact_command_evidence(
@@ -656,124 +1063,237 @@ fn build_digest_commands(commands: &[AgentCanvasCommandEvidence]) -> Vec<String>
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_persisted_turn_summary(
+    turn_id: String,
+    status: String,
+    parent_turn_id: Option<String>,
+    child_turn_id: Option<String>,
+    forked_from_thread_id: Option<String>,
+    started_after_rollback: bool,
+    last_agent_message: Option<String>,
+    commands: Vec<AgentCanvasCommandEvidence>,
+    file_paths: Vec<String>,
+    errors: Vec<String>,
+) -> PersistedTurnSummary {
+    let node_id = format!("turn:{turn_id}");
+    let parent_node_id = parent_turn_id
+        .as_ref()
+        .map(|parent_turn_id| format!("turn:{parent_turn_id}"));
+    let (commands, total_command_count, omitted_command_count) = compact_command_evidence(commands);
+    let (file_paths, total_file_path_count, omitted_file_path_count) = compact_string_evidence(
+        file_paths,
+        SUMMARY_MAX_FILE_PATH_ITEMS,
+        SUMMARY_MAX_FILE_PATH_TEXT_BYTES,
+    );
+    let (errors, total_error_count, omitted_error_count) = compact_string_evidence(
+        errors,
+        SUMMARY_MAX_ERROR_ITEMS,
+        SUMMARY_MAX_ERROR_TEXT_BYTES,
+    );
+    let agent_message = last_agent_message
+        .as_deref()
+        .and_then(|text| normalize_summary_text(text, SUMMARY_MAX_AGENT_MESSAGE_BYTES));
+    let command_digest = build_digest_commands(commands.as_slice());
+    let file_path_digest = build_digest_strings(file_paths.as_slice());
+    let error_digest = build_digest_strings(errors.as_slice());
+    let signal = classify_turn_signal(
+        total_command_count,
+        total_file_path_count,
+        total_error_count,
+    );
+    let summary_text = build_compact_turn_summary(
+        status.as_str(),
+        signal,
+        parent_turn_id.as_deref(),
+        child_turn_id.as_deref(),
+        forked_from_thread_id.as_deref(),
+        started_after_rollback,
+        agent_message.as_deref(),
+        command_digest.as_slice(),
+        file_path_digest.as_slice(),
+        error_digest.as_slice(),
+        total_command_count,
+        total_file_path_count,
+        total_error_count,
+    );
+    PersistedTurnSummary {
+        turn_id,
+        status,
+        parent_turn_id,
+        child_turn_id,
+        forked_from_thread_id,
+        started_after_rollback,
+        node_id,
+        parent_node_id,
+        signal: signal.to_string(),
+        agent_message,
+        command_digest,
+        file_path_digest,
+        error_digest,
+        commands,
+        file_paths,
+        errors,
+        total_command_count,
+        total_file_path_count,
+        total_error_count,
+        omitted_command_count,
+        omitted_file_path_count,
+        omitted_error_count,
+        compact_summary: summary_text,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_turn_summary_payload(
+    thread_id: &str,
+    turn_id: &str,
+    status: &str,
+    node_id: &str,
+    parent_node_id: Option<String>,
+    signal: &str,
+    summary: String,
+    short_summary: Option<String>,
+    parent_turn_id: Option<String>,
+    child_turn_id: Option<String>,
+    forked_from_thread_id: Option<String>,
+    started_after_rollback: bool,
+    agent_message: Option<String>,
+    command_digest: Vec<String>,
+    file_path_digest: Vec<String>,
+    error_digest: Vec<String>,
+    commands: Vec<AgentCanvasCommandEvidence>,
+    file_paths: Vec<String>,
+    errors: Vec<String>,
+    total_command_count: usize,
+    total_file_path_count: usize,
+    total_error_count: usize,
+    omitted_command_count: usize,
+    omitted_file_path_count: usize,
+    omitted_error_count: usize,
+) -> Value {
+    serde_json::json!({
+        "schema_version": AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION,
+        "summary_kind": AGENTCANVAS_TURN_SUMMARY_KIND,
+        "thread_id": thread_id,
+        "session_id": turn_id,
+        "forked_from_thread_id": forked_from_thread_id.clone(),
+        "nodes": [
+            {
+                "node_id": node_id,
+                "parent_id": parent_node_id,
+                "node_type": "turn",
+                "title": format!("Turn {turn_id}"),
+                "summary": summary,
+                "status": status,
+                "brief": {
+                    "signal": signal,
+                    "short_summary": short_summary,
+                    "agent_message": agent_message,
+                    "primary_command": command_digest.first().cloned(),
+                    "primary_file_path": file_path_digest.first().cloned(),
+                    "primary_error": error_digest.first().cloned(),
+                },
+                "lineage": {
+                    "parent_turn_id": parent_turn_id,
+                    "child_turn_id": child_turn_id,
+                    "forked_from_thread_id": forked_from_thread_id,
+                    "started_after_rollback": started_after_rollback,
+                },
+                "counts": {
+                    "commands_total": total_command_count,
+                    "commands_indexed": commands.len(),
+                    "commands_omitted": omitted_command_count,
+                    "file_paths_total": total_file_path_count,
+                    "file_paths_indexed": file_paths.len(),
+                    "file_paths_omitted": omitted_file_path_count,
+                    "errors_total": total_error_count,
+                    "errors_indexed": errors.len(),
+                    "errors_omitted": omitted_error_count,
+                },
+                "digest": {
+                    "command_examples": command_digest,
+                    "file_path_examples": file_path_digest,
+                    "error_examples": error_digest,
+                },
+                "evidence": {
+                    "file_paths": file_paths,
+                    "commands": commands,
+                    "errors": errors,
+                }
+            }
+        ]
+    })
+}
+
+async fn emit_and_persist_summary(
+    state_db_ctx: &StateRuntime,
+    summary_tx: Option<&mpsc::UnboundedSender<Value>>,
+    summary_id: String,
+    thread_id: String,
+    session_id: String,
+    schema_version: String,
+    root_node_id: Option<String>,
+    summary: Value,
+) {
+    if let Some(summary_tx) = summary_tx
+        && let Err(err) = summary_tx.send(summary.clone())
+    {
+        trace!("failed to emit agentcanvas summary update: {err}");
+    }
+    let params = SessionSummaryPersistParams {
+        summary_id: Some(summary_id),
+        thread_id,
+        session_id,
+        schema_version,
+        root_node_id,
+        summary,
+    };
+    if let Err(err) = state_db_ctx.upsert_session_summary(&params).await {
+        warn!("failed to persist agentcanvas summary update: {err}");
+    }
+}
+
 async fn persist_agentcanvas_turn_summaries(
     state_db_ctx: Option<&StateRuntime>,
     accumulator: &AgentCanvasSummaryAccumulator,
     summary_updates: AgentCanvasSummaryUpdates,
+    summary_tx: Option<&mpsc::UnboundedSender<Value>>,
 ) {
     let (Some(state_db_ctx), Some(thread_id)) = (state_db_ctx, accumulator.thread_id.as_deref())
     else {
         return;
     };
+    let AgentCanvasSummaryUpdates {
+        progressive_turn_summaries,
+        completed_turn_summaries,
+        phase_summaries,
+        rolled_back_turn_ids,
+    } = summary_updates;
 
-    let completed_turn_summaries = summary_updates.completed_turn_summaries;
-    let completed_turn_count = completed_turn_summaries.len();
-    struct PersistedTurnSummary {
-        turn_id: String,
-        status: String,
-        parent_turn_id: Option<String>,
-        child_turn_id: Option<String>,
-        forked_from_thread_id: Option<String>,
-        started_after_rollback: bool,
-        node_id: String,
-        parent_node_id: Option<String>,
-        signal: String,
-        agent_message: Option<String>,
-        command_digest: Vec<String>,
-        file_path_digest: Vec<String>,
-        error_digest: Vec<String>,
-        commands: Vec<AgentCanvasCommandEvidence>,
-        file_paths: Vec<String>,
-        errors: Vec<String>,
-        total_command_count: usize,
-        total_file_path_count: usize,
-        total_error_count: usize,
-        omitted_command_count: usize,
-        omitted_file_path_count: usize,
-        omitted_error_count: usize,
-        compact_summary: String,
-    }
-
-    let mut persisted_turn_summaries = Vec::with_capacity(completed_turn_count);
-    let mut llm_inputs = Vec::with_capacity(completed_turn_count);
-
-    for (index, turn_summary) in completed_turn_summaries.iter().enumerate() {
-        let turn_summary = turn_summary.clone();
-        let CompletedAgentCanvasTurnSummary {
+    for progressive_turn_summary in progressive_turn_summaries {
+        let ProgressiveAgentCanvasTurnSummary {
             turn_id,
-            status,
             parent_turn_id,
             forked_from_thread_id,
             started_after_rollback,
-            last_agent_message,
             commands,
             file_paths,
             errors,
-        } = turn_summary;
-        let node_id = format!("turn:{turn_id}");
-        let parent_node_id = parent_turn_id
-            .as_ref()
-            .map(|parent_turn_id| format!("turn:{parent_turn_id}"));
-        let child_turn_id = (index + 1 < completed_turn_count)
-            .then(|| completed_turn_summaries[index + 1].turn_id.as_str());
-        let (commands, total_command_count, omitted_command_count) =
-            compact_command_evidence(commands);
-        let (file_paths, total_file_path_count, omitted_file_path_count) = compact_string_evidence(
-            file_paths,
-            SUMMARY_MAX_FILE_PATH_ITEMS,
-            SUMMARY_MAX_FILE_PATH_TEXT_BYTES,
-        );
-        let (errors, total_error_count, omitted_error_count) = compact_string_evidence(
-            errors,
-            SUMMARY_MAX_ERROR_ITEMS,
-            SUMMARY_MAX_ERROR_TEXT_BYTES,
-        );
-        let agent_message = last_agent_message
-            .as_deref()
-            .and_then(|text| normalize_summary_text(text, SUMMARY_MAX_AGENT_MESSAGE_BYTES));
-        let command_digest = build_digest_commands(commands.as_slice());
-        let file_path_digest = build_digest_strings(file_paths.as_slice());
-        let error_digest = build_digest_strings(errors.as_slice());
-        let signal = classify_turn_signal(
-            total_command_count,
-            total_file_path_count,
-            total_error_count,
-        );
-        let summary_text = build_compact_turn_summary(
-            status.as_str(),
-            signal,
-            parent_turn_id.as_deref(),
-            child_turn_id,
-            agent_message.as_deref(),
-            command_digest.as_slice(),
-            file_path_digest.as_slice(),
-            error_digest.as_slice(),
-            total_command_count,
-            total_file_path_count,
-            total_error_count,
-        );
-        let child_turn_id = child_turn_id.map(ToOwned::to_owned);
-        let command_digest_for_evidence = command_digest.first().cloned();
-        let file_path_digest_for_evidence = file_path_digest.first().cloned();
-        let error_digest_for_evidence = error_digest.first().cloned();
-        llm_inputs.push(TurnSummaryEvidence {
-            turn_id: turn_id.clone(),
-            status: status.clone(),
-            parent_turn_id: parent_turn_id.clone(),
-            child_turn_id: child_turn_id.clone(),
-            forked_from_thread_id: forked_from_thread_id.clone(),
+        } = progressive_turn_summary;
+        let persisted_turn_summary = build_persisted_turn_summary(
+            turn_id.clone(),
+            "in_progress".to_string(),
+            parent_turn_id,
+            None,
+            forked_from_thread_id,
             started_after_rollback,
-            signal: signal.to_string(),
-            last_agent_message: agent_message.clone(),
-            primary_command: command_digest_for_evidence,
-            primary_file_path: file_path_digest_for_evidence,
-            primary_error: error_digest_for_evidence,
-            total_commands: total_command_count,
-            total_file_paths: total_file_path_count,
-            total_errors: total_error_count,
-        });
-
-        persisted_turn_summaries.push(PersistedTurnSummary {
+            None,
+            commands,
+            file_paths,
+            errors,
+        );
+        let PersistedTurnSummary {
             turn_id,
             status,
             parent_turn_id,
@@ -782,8 +1302,8 @@ async fn persist_agentcanvas_turn_summaries(
             started_after_rollback,
             node_id,
             parent_node_id,
-            signal: signal.to_string(),
-            agent_message: agent_message.clone(),
+            signal,
+            agent_message,
             command_digest,
             file_path_digest,
             error_digest,
@@ -796,10 +1316,115 @@ async fn persist_agentcanvas_turn_summaries(
             omitted_command_count,
             omitted_file_path_count,
             omitted_error_count,
-            compact_summary: summary_text,
-        });
+            compact_summary,
+        } = persisted_turn_summary;
+        let summary = build_turn_summary_payload(
+            thread_id,
+            turn_id.as_str(),
+            status.as_str(),
+            node_id.as_str(),
+            parent_node_id,
+            signal.as_str(),
+            compact_summary,
+            None, // short_summary
+            parent_turn_id,
+            child_turn_id,
+            forked_from_thread_id,
+            started_after_rollback,
+            agent_message,
+            command_digest,
+            file_path_digest,
+            error_digest,
+            commands,
+            file_paths,
+            errors,
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+            omitted_command_count,
+            omitted_file_path_count,
+            omitted_error_count,
+        );
+        emit_and_persist_summary(
+            state_db_ctx,
+            summary_tx,
+            format!("agentcanvas.turn:{thread_id}:{turn_id}"),
+            thread_id.to_string(),
+            turn_id.clone(),
+            AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION.to_string(),
+            Some(node_id),
+            summary,
+        )
+        .await;
     }
 
+    let completed_turn_count = completed_turn_summaries.len();
+    let mut persisted_turn_summaries = Vec::with_capacity(completed_turn_count);
+    let mut llm_inputs = Vec::with_capacity(completed_turn_count);
+    for (index, turn_summary) in completed_turn_summaries.iter().enumerate() {
+        let child_turn_id = (index + 1 < completed_turn_count)
+            .then(|| completed_turn_summaries[index + 1].turn_id.clone());
+        let persisted_turn_summary = build_persisted_turn_summary(
+            turn_summary.turn_id.clone(),
+            turn_summary.status.clone(),
+            turn_summary.parent_turn_id.clone(),
+            child_turn_id,
+            turn_summary.forked_from_thread_id.clone(),
+            turn_summary.started_after_rollback,
+            turn_summary.last_agent_message.clone(),
+            turn_summary.commands.clone(),
+            turn_summary.file_paths.clone(),
+            turn_summary.errors.clone(),
+        );
+        llm_inputs.push(TurnSummaryEvidence {
+            turn_id: persisted_turn_summary.turn_id.clone(),
+            status: persisted_turn_summary.status.clone(),
+            parent_turn_id: persisted_turn_summary.parent_turn_id.clone(),
+            child_turn_id: persisted_turn_summary.child_turn_id.clone(),
+            forked_from_thread_id: persisted_turn_summary.forked_from_thread_id.clone(),
+            started_after_rollback: persisted_turn_summary.started_after_rollback,
+            signal: persisted_turn_summary.signal.clone(),
+            last_agent_message: persisted_turn_summary.agent_message.clone(),
+            primary_command: persisted_turn_summary.command_digest.first().cloned(),
+            primary_file_path: persisted_turn_summary.file_path_digest.first().cloned(),
+            primary_error: persisted_turn_summary.error_digest.first().cloned(),
+            total_commands: persisted_turn_summary.total_command_count,
+            total_file_paths: persisted_turn_summary.total_file_path_count,
+            total_errors: persisted_turn_summary.total_error_count,
+            command_examples: persisted_turn_summary.command_digest.clone(),
+            file_path_examples: persisted_turn_summary.file_path_digest.clone(),
+            error_examples: persisted_turn_summary.error_digest.clone(),
+            parent_turn_snapshot: None,
+            child_turn_snapshot: None,
+        });
+        persisted_turn_summaries.push(persisted_turn_summary);
+    }
+
+    let turn_snapshots: BTreeMap<String, TurnSummarySnapshot> = llm_inputs
+        .iter()
+        .map(|input| {
+            (
+                input.turn_id.clone(),
+                TurnSummarySnapshot {
+                    turn_id: input.turn_id.clone(),
+                    status: input.status.clone(),
+                    signal: input.signal.clone(),
+                    summary_hint: input.last_agent_message.clone(),
+                    primary_command: input.primary_command.clone(),
+                    primary_file_path: input.primary_file_path.clone(),
+                    primary_error: input.primary_error.clone(),
+                },
+            )
+        })
+        .collect();
+    for llm_input in &mut llm_inputs {
+        if let Some(parent_turn_id) = llm_input.parent_turn_id.as_ref() {
+            llm_input.parent_turn_snapshot = turn_snapshots.get(parent_turn_id).cloned();
+        }
+        if let Some(child_turn_id) = llm_input.child_turn_id.as_ref() {
+            llm_input.child_turn_snapshot = turn_snapshots.get(child_turn_id).cloned();
+        }
+    }
     let llm_summaries = match generate_turn_summaries(&llm_inputs).await {
         Ok(summary_map) => summary_map,
         Err(err) => {
@@ -809,7 +1434,6 @@ async fn persist_agentcanvas_turn_summaries(
             BTreeMap::new()
         }
     };
-
     for persisted_turn_summary in persisted_turn_summaries {
         let PersistedTurnSummary {
             turn_id,
@@ -836,78 +1460,191 @@ async fn persist_agentcanvas_turn_summaries(
             omitted_error_count,
             compact_summary,
         } = persisted_turn_summary;
-        let summary = llm_summaries
-            .get(turn_id.as_str())
-            .cloned()
+        let llm_result = llm_summaries.get(turn_id.as_str());
+        let summary_text = llm_result
+            .and_then(|r| {
+                normalize_summary_text(&r.detail_summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
+            })
+            .filter(|summary| is_structured_turn_summary(summary))
             .unwrap_or(compact_summary);
-        let summary = serde_json::json!({
-            "schema_version": AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION,
-            "summary_kind": AGENTCANVAS_TURN_SUMMARY_KIND,
-            "thread_id": thread_id,
-            "session_id": turn_id.clone(),
-            "forked_from_thread_id": forked_from_thread_id.clone(),
-            "nodes": [
-                {
-                    "node_id": node_id,
-                    "parent_id": parent_node_id,
-                    "node_type": "turn",
-                    "title": format!("Turn {turn_id}"),
-                    "summary": summary,
-                    "status": status,
-                    "brief": {
-                        "signal": signal,
-                        "agent_message": agent_message,
-                        "primary_command": command_digest.first().cloned(),
-                        "primary_file_path": file_path_digest.first().cloned(),
-                        "primary_error": error_digest.first().cloned(),
-                    },
-                    "lineage": {
-                        "parent_turn_id": parent_turn_id,
-                        "child_turn_id": child_turn_id,
-                        "forked_from_thread_id": forked_from_thread_id,
-                        "started_after_rollback": started_after_rollback,
-                    },
-                    "counts": {
-                        "commands_total": total_command_count,
-                        "commands_indexed": commands.len(),
-                        "commands_omitted": omitted_command_count,
-                        "file_paths_total": total_file_path_count,
-                        "file_paths_indexed": file_paths.len(),
-                        "file_paths_omitted": omitted_file_path_count,
-                        "errors_total": total_error_count,
-                        "errors_indexed": errors.len(),
-                        "errors_omitted": omitted_error_count,
-                    },
-                    "digest": {
-                        "command_examples": command_digest,
-                        "file_path_examples": file_path_digest,
-                        "error_examples": error_digest,
-                    },
-                    "evidence": {
-                        "file_paths": file_paths,
-                        "commands": commands,
-                        "errors": errors,
-                    }
-                }
-            ]
-        });
-        let params = SessionSummaryPersistParams {
-            summary_id: Some(format!("agentcanvas.turn:{thread_id}:{turn_id}")),
-            thread_id: thread_id.to_string(),
-            session_id: turn_id.clone(),
-            schema_version: AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION.to_string(),
-            root_node_id: Some(node_id),
+        let llm_short_summary = llm_result
+            .and_then(|r| {
+                normalize_summary_text(&r.short_summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
+            })
+            .filter(|s| is_structured_turn_summary(s));
+        let summary = build_turn_summary_payload(
+            thread_id,
+            turn_id.as_str(),
+            status.as_str(),
+            node_id.as_str(),
+            parent_node_id,
+            signal.as_str(),
+            summary_text,
+            llm_short_summary,
+            parent_turn_id,
+            child_turn_id,
+            forked_from_thread_id,
+            started_after_rollback,
+            agent_message,
+            command_digest,
+            file_path_digest,
+            error_digest,
+            commands,
+            file_paths,
+            errors,
+            total_command_count,
+            total_file_path_count,
+            total_error_count,
+            omitted_command_count,
+            omitted_file_path_count,
+            omitted_error_count,
+        );
+        emit_and_persist_summary(
+            state_db_ctx,
+            summary_tx,
+            format!("agentcanvas.turn:{thread_id}:{turn_id}"),
+            thread_id.to_string(),
+            turn_id.clone(),
+            AGENTCANVAS_TURN_SUMMARY_SCHEMA_VERSION.to_string(),
+            Some(node_id),
             summary,
+        )
+        .await;
+    }
+
+    if !phase_summaries.is_empty() {
+        let phase_llm_inputs: Vec<TurnSummaryEvidence> = phase_summaries
+            .iter()
+            .map(|phase_summary| TurnSummaryEvidence {
+                turn_id: phase_summary.phase_id.clone(),
+                status: phase_summary.status.clone(),
+                parent_turn_id: phase_summary.parent_turn_id.clone(),
+                child_turn_id: phase_summary.child_turn_ids.last().cloned(),
+                forked_from_thread_id: None,
+                started_after_rollback: false,
+                signal: format!("phase:{}", phase_summary.signal),
+                last_agent_message: Some(format!(
+                    "Phase spans {} turn(s)",
+                    phase_summary.child_turn_ids.len()
+                )),
+                primary_command: phase_summary.command_digest.first().cloned(),
+                primary_file_path: phase_summary.file_path_digest.first().cloned(),
+                primary_error: phase_summary.error_digest.first().cloned(),
+                total_commands: phase_summary.total_command_count,
+                total_file_paths: phase_summary.total_file_path_count,
+                total_errors: phase_summary.total_error_count,
+                command_examples: phase_summary.command_digest.clone(),
+                file_path_examples: phase_summary.file_path_digest.clone(),
+                error_examples: phase_summary.error_digest.clone(),
+                parent_turn_snapshot: None,
+                child_turn_snapshot: None,
+            })
+            .collect();
+        let phase_llm_summaries = match generate_turn_summaries(&phase_llm_inputs).await {
+            Ok(summary_map) => summary_map,
+            Err(err) => {
+                warn!("failed to generate LLM phase summaries: {err}");
+                BTreeMap::new()
+            }
         };
-        if let Err(err) = state_db_ctx.upsert_session_summary(&params).await {
-            warn!(
-                "failed to persist agentcanvas turn summary for thread {} turn {}: {err}",
-                thread_id, turn_id
-            );
+        for phase_summary in phase_summaries {
+            let PhaseSummaryCandidate {
+                phase_id,
+                parent_phase_id,
+                child_turn_ids,
+                parent_turn_id,
+                status,
+                signal,
+                command_digest,
+                file_path_digest,
+                error_digest,
+                commands,
+                file_paths,
+                errors,
+                total_command_count,
+                total_file_path_count,
+                total_error_count,
+                omitted_command_count,
+                omitted_file_path_count,
+                omitted_error_count,
+                compact_summary,
+            } = phase_summary;
+            let phase_node_id = format!("phase:{phase_id}");
+            let phase_llm_result = phase_llm_summaries.get(phase_id.as_str());
+            let summary_text = phase_llm_result
+                .and_then(|r| {
+                    normalize_summary_text(&r.detail_summary, SUMMARY_MAX_AGENT_MESSAGE_BYTES)
+                })
+                .filter(|summary| is_structured_turn_summary(summary))
+                .unwrap_or(compact_summary);
+            let summary = serde_json::json!({
+                "schema_version": AGENTCANVAS_PHASE_SUMMARY_SCHEMA_VERSION,
+                "summary_kind": AGENTCANVAS_PHASE_SUMMARY_KIND,
+                "thread_id": thread_id,
+                "session_id": format!("phase:{phase_id}"),
+                "nodes": [
+                    {
+                        "node_id": phase_node_id.clone(),
+                        "parent_id": parent_phase_id.as_ref().map(|id| format!("phase:{id}")),
+                        "node_type": "phase",
+                        "title": format!("Phase {phase_id}"),
+                        "summary": summary_text,
+                        "status": status,
+                        "brief": {
+                            "signal": signal,
+                            "short_summary": phase_llm_result.map(|r| r.short_summary.clone()),
+                            "agent_message": serde_json::Value::Null,
+                            "primary_command": command_digest.first().cloned(),
+                            "primary_file_path": file_path_digest.first().cloned(),
+                            "primary_error": error_digest.first().cloned(),
+                        },
+                        "lineage": {
+                            "parent_turn_id": parent_turn_id,
+                            "child_turn_ids": child_turn_ids.clone(),
+                            "parent_phase_id": parent_phase_id,
+                            "anchor_turn_id": child_turn_ids.last().cloned(),
+                        },
+                        "counts": {
+                            "turns_total": child_turn_ids.len(),
+                            "commands_total": total_command_count,
+                            "commands_indexed": commands.len(),
+                            "commands_omitted": omitted_command_count,
+                            "file_paths_total": total_file_path_count,
+                            "file_paths_indexed": file_paths.len(),
+                            "file_paths_omitted": omitted_file_path_count,
+                            "errors_total": total_error_count,
+                            "errors_indexed": errors.len(),
+                            "errors_omitted": omitted_error_count,
+                        },
+                        "digest": {
+                            "command_examples": command_digest,
+                            "file_path_examples": file_path_digest,
+                            "error_examples": error_digest,
+                        },
+                        "evidence": {
+                            "child_turn_ids": child_turn_ids,
+                            "file_paths": file_paths,
+                            "commands": commands,
+                            "errors": errors,
+                        }
+                    }
+                ]
+            });
+            emit_and_persist_summary(
+                state_db_ctx,
+                summary_tx,
+                format!("agentcanvas.phase:{thread_id}:{phase_id}"),
+                thread_id.to_string(),
+                format!("phase:{phase_id}"),
+                AGENTCANVAS_PHASE_SUMMARY_SCHEMA_VERSION.to_string(),
+                Some(phase_node_id),
+                summary,
+            )
+            .await;
         }
     }
 
-    for turn_id in summary_updates.rolled_back_turn_ids {
+    for turn_id in rolled_back_turn_ids {
         let Ok(Some(mut summary)) = state_db_ctx
             .read_session_summary_by_thread_and_session(thread_id, turn_id.as_str())
             .await
@@ -967,12 +1704,17 @@ async fn persist_agentcanvas_turn_summaries(
             root_node_id,
             summary,
         };
-        if let Err(err) = state_db_ctx.upsert_session_summary(&params).await {
-            warn!(
-                "failed to mark agentcanvas turn summary rolled back for thread {} turn {}: {err}",
-                thread_id, turn_id
-            );
-        }
+        emit_and_persist_summary(
+            state_db_ctx,
+            summary_tx,
+            params.summary_id.clone().unwrap_or_default(),
+            params.thread_id.clone(),
+            params.session_id.clone(),
+            params.schema_version.clone(),
+            params.root_node_id.clone(),
+            params.summary,
+        )
+        .await;
     }
 }
 
@@ -1289,6 +2031,7 @@ impl RolloutRecorder {
         // future will yield, which is fine – we only need to ensure we do not
         // perform *blocking* I/O on the caller's thread.
         let (tx, rx) = mpsc::channel::<RolloutCmd>(256);
+        let (summary_tx, summary_rx) = mpsc::unbounded_channel::<Value>();
 
         // Spawn a Tokio task that owns the file handle and performs async
         // writes. Using `tokio::fs::File` keeps everything on the async I/O
@@ -1304,6 +2047,7 @@ impl RolloutRecorder {
             state_builder,
             config.model_provider_id.clone(),
             config.memories.generate_memories,
+            Some(summary_tx.clone()),
         ));
 
         Ok(Self {
@@ -1311,6 +2055,7 @@ impl RolloutRecorder {
             rollout_path,
             state_db: state_db_ctx,
             event_persistence_mode,
+            summary_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(summary_rx))),
         })
     }
 
@@ -1320,6 +2065,11 @@ impl RolloutRecorder {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.state_db.clone()
+    }
+
+    pub fn summary_receiver(&self) -> Option<mpsc::UnboundedReceiver<Value>> {
+        let mut guard = self.summary_rx.lock().ok()?;
+        guard.take()
     }
 
     pub(crate) async fn record_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
@@ -1556,6 +2306,7 @@ async fn rollout_writer(
     mut state_builder: Option<ThreadMetadataBuilder>,
     default_provider: String,
     generate_memories: bool,
+    summary_tx: Option<mpsc::UnboundedSender<Value>>,
 ) -> std::io::Result<()> {
     let mut writer = file.map(|file| JsonlWriter { file });
     let mut buffered_items = Vec::<RolloutItem>::new();
@@ -1611,6 +2362,7 @@ async fn rollout_writer(
                     &mut state_builder,
                     default_provider.as_str(),
                     &mut agentcanvas_summary_accumulator,
+                    summary_tx.as_ref(),
                 )
                 .await?;
             }
@@ -1652,6 +2404,7 @@ async fn rollout_writer(
                                 &mut state_builder,
                                 default_provider.as_str(),
                                 &mut agentcanvas_summary_accumulator,
+                                summary_tx.as_ref(),
                             )
                             .await?;
                             buffered_items.clear();
@@ -1732,6 +2485,7 @@ async fn write_and_reconcile_items(
     state_builder: &mut Option<ThreadMetadataBuilder>,
     default_provider: &str,
     agentcanvas_summary_accumulator: &mut AgentCanvasSummaryAccumulator,
+    summary_tx: Option<&mpsc::UnboundedSender<Value>>,
 ) -> std::io::Result<()> {
     if let Some(writer) = writer.as_mut() {
         for item in items {
@@ -1757,6 +2511,7 @@ async fn write_and_reconcile_items(
         state_db_ctx,
         agentcanvas_summary_accumulator,
         summary_updates,
+        summary_tx,
     )
     .await;
     Ok(())
@@ -2586,11 +3341,10 @@ mod tests {
         );
         let summary_text = node["summary"].as_str().expect("summary text should exist");
         assert!(!summary_text.trim().is_empty());
-        if summary_text.contains("status=") {
-            assert!(summary_text.len() <= SUMMARY_MAX_AGENT_MESSAGE_BYTES);
-        } else {
-            assert!(!summary_text.trim().is_empty());
-        }
+        assert!(summary_text.contains("Outcome:"));
+        assert!(summary_text.contains("Evidence:"));
+        assert!(summary_text.contains("Lineage:"));
+        assert!(summary_text.len() <= SUMMARY_MAX_AGENT_MESSAGE_BYTES);
         assert_eq!(node["brief"]["signal"], serde_json::json!("error"));
         assert!(
             node["brief"]["agent_message"]

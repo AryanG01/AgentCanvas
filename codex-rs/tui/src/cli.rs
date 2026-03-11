@@ -114,15 +114,19 @@ pub struct Cli {
     #[arg(long = "websocket-port", default_value_t = 3737)]
     pub websocket_port: u16,
 
-    /// Enable AgentCanvas UI visualization (serves web UI and auto-opens browser)
-    #[arg(long = "ui", default_value_t = false)]
+    /// Enable AgentCanvas UI visualization (default: enabled)
+    #[arg(long = "ui", default_value_t = false, conflicts_with = "no_ui")]
     pub ui_enabled: bool,
+
+    /// Disable AgentCanvas UI visualization and browser auto-open.
+    #[arg(long = "no-ui", default_value_t = false)]
+    pub no_ui: bool,
 
     /// Port for AgentCanvas UI HTTP server
     #[arg(long = "ui-port", default_value_t = 8080)]
     pub ui_port: u16,
 
-    /// Path to AgentCanvas UI dist/ folder
+    /// Path to AgentCanvas UI dist/ folder (auto-detected when omitted)
     #[arg(long = "ui-dist", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub ui_dist_path: Option<PathBuf>,
 

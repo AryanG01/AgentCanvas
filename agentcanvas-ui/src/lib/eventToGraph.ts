@@ -1,5 +1,5 @@
 import type { Node, Edge } from '@xyflow/react'
-import type { AppEvent, CommandExecutionEvent, GraphNodeData } from './types'
+import type { AppEvent, CommandExecutionEvent, GraphNodeData, SummaryNodeEvent } from './types'
 
 type GraphNode = Node<GraphNodeData>
 
@@ -7,6 +7,60 @@ export interface GraphResult {
   nodes: GraphNode[]
   edges: Edge[]
   turnOrder: string[]  // ordered list of turnIds for sequential flow edges
+}
+
+const SUMMARY_LABEL_MAX = 80
+
+/**
+ * Extract a short, human-readable label from a SummaryNodeEvent.
+ *
+ * Priority:
+ * 1. LLM short_summary (if available in brief)
+ * 2. Auto-generated action label from counts + evidence
+ * 3. Primary evidence (command, file, error)
+ * 4. Agent message snippet (last resort)
+ */
+function extractSummaryLabel(event: SummaryNodeEvent): string {
+  // 1. LLM short_summary from brief
+  const shortSummary = event.brief.shortSummary?.trim()
+  if (shortSummary) return shortSummary.slice(0, SUMMARY_LABEL_MAX)
+
+  // 2. Auto-generated action label from counts + evidence
+  const { commandsTotal, filePathsTotal, errorsTotal } = event.counts
+  if (errorsTotal > 0) {
+    const errSnippet = event.brief.primaryError?.slice(0, 40) ?? ''
+    return errSnippet
+      ? `Failed: ${errSnippet}`
+      : `Build failed (${errorsTotal} error${errorsTotal !== 1 ? 's' : ''})`
+  }
+  if (filePathsTotal > 0 && commandsTotal > 0) {
+    return `Edited ${filePathsTotal} file${filePathsTotal !== 1 ? 's' : ''}, ran ${commandsTotal} command${commandsTotal !== 1 ? 's' : ''}`
+  }
+  if (filePathsTotal > 0) {
+    const fileSnippet = event.brief.primaryFilePath?.split('/').pop() ?? ''
+    return fileSnippet
+      ? `Edited ${filePathsTotal} file${filePathsTotal !== 1 ? 's' : ''} (${fileSnippet})`
+      : `Edited ${filePathsTotal} file${filePathsTotal !== 1 ? 's' : ''}`
+  }
+  if (commandsTotal > 0) {
+    const cmdSnippet = event.brief.primaryCommand?.slice(0, 30) ?? ''
+    return cmdSnippet
+      ? `Ran ${commandsTotal} command${commandsTotal !== 1 ? 's' : ''} (${cmdSnippet})`
+      : `Ran ${commandsTotal} command${commandsTotal !== 1 ? 's' : ''}`
+  }
+
+  // 3. Primary evidence fallback
+  if (event.brief.primaryError) return `Error: ${event.brief.primaryError.slice(0, 60)}`
+  if (event.brief.primaryCommand) return `$ ${event.brief.primaryCommand.slice(0, 60)}`
+  if (event.brief.primaryFilePath) return event.brief.primaryFilePath.slice(0, 60)
+
+  // 4. Agent message snippet (last resort)
+  const agentMsg = event.brief.agentMessage?.trim()
+  if (agentMsg) return agentMsg.slice(0, SUMMARY_LABEL_MAX)
+
+  // 5. Status fallback
+  if (event.status === 'completed') return 'Completed'
+  return event.status ?? 'Summary'
 }
 
 export function buildGraph(events: AppEvent[]): GraphResult {
@@ -91,53 +145,97 @@ export function buildGraph(events: AppEvent[]): GraphResult {
       const node = nodes.find(n => n.id === `turn-${event.turnId}`)
       if (node) node.data = { ...node.data, status: event.status }
     } else if (event.type === 'SummaryNode') {
-      const turnNode = nodes.find(n => n.id === `turn-${event.turnId}`)
-      if (turnNode) {
-        if (turnNode.data.label === '(typing…)' && event.summaryText.trim()) {
-          turnNode.data = { ...turnNode.data, label: event.summaryText }
-        }
-        if (event.status === 'rolled_back') {
-          turnNode.data = { ...turnNode.data, status: 'cancelled' }
-        }
-      }
-
-      const summaryNodeId = `summary-${event.turnId}`
-      const summaryLabel = event.brief.agentMessage?.trim()
-        || event.summaryText.trim()
-        || `${event.brief.signal} summary`
       const summaryStatus =
         event.status === 'rolled_back'
           ? 'cancelled'
-          : event.status === 'failed' || event.brief.signal === 'error'
-            ? 'error'
-            : 'success'
-      const existingSummaryNode = nodes.find(n => n.id === summaryNodeId)
-      if (existingSummaryNode) {
-        existingSummaryNode.data = {
-          ...existingSummaryNode.data,
-          label: summaryLabel,
-          status: summaryStatus,
-          rawEvent: event,
+          : event.status === 'in_progress'
+            ? 'running'
+            : event.status === 'failed' || event.brief.signal === 'error' || event.status === 'error'
+              ? 'error'
+              : 'success'
+      if (event.nodeType === 'phase') {
+        const phaseNodeId = `phase-${event.id}`
+        const phaseLabel = event.brief.shortSummary?.trim()
+          || extractSummaryLabel(event)
+          || `Phase (${event.lineage.childTurnIds.length} turn${event.lineage.childTurnIds.length === 1 ? '' : 's'})`
+        const existingPhaseNode = nodes.find(n => n.id === phaseNodeId)
+        if (existingPhaseNode) {
+          existingPhaseNode.data = {
+            ...existingPhaseNode.data,
+            label: phaseLabel,
+            status: summaryStatus,
+            rawEvent: event,
+          }
+        } else {
+          nodes.push({
+            id: phaseNodeId,
+            type: 'eventNode',
+            position: { x: 0, y: 0 },
+            data: {
+              kind: 'phase',
+              label: phaseLabel,
+              status: summaryStatus,
+              turnId: event.turnId,
+              rawEvent: event,
+            },
+          })
+        }
+        const phaseEdgeSources = event.lineage.childTurnIds.length > 0
+          ? event.lineage.childTurnIds
+          : [event.turnId]
+        for (const phaseTurnId of phaseEdgeSources) {
+          const edgeId = `detail-${phaseNodeId}-${phaseTurnId}`
+          if (!edges.find(e => e.id === edgeId)) {
+            edges.push({
+              id: edgeId,
+              source: `turn-${phaseTurnId}`,
+              target: phaseNodeId,
+              data: { kind: 'detail' },
+            })
+          }
         }
       } else {
-        nodes.push({
-          id: summaryNodeId,
-          type: 'eventNode',
-          position: { x: 0, y: 0 },
-          data: {
-            kind: 'summary',
+        const turnNode = nodes.find(n => n.id === `turn-${event.turnId}`)
+        if (turnNode) {
+          const extractedLabel = extractSummaryLabel(event)
+          if (turnNode.data.label === '(typing…)' && extractedLabel) {
+            turnNode.data = { ...turnNode.data, label: extractedLabel }
+          }
+          if (event.status === 'rolled_back') {
+            turnNode.data = { ...turnNode.data, status: 'cancelled' }
+          }
+        }
+
+        const summaryNodeId = `summary-${event.turnId}`
+        const summaryLabel = extractSummaryLabel(event)
+        const existingSummaryNode = nodes.find(n => n.id === summaryNodeId)
+        if (existingSummaryNode) {
+          existingSummaryNode.data = {
+            ...existingSummaryNode.data,
             label: summaryLabel,
             status: summaryStatus,
-            turnId: event.turnId,
             rawEvent: event,
-          },
-        })
-        edges.push({
-          id: `detail-${summaryNodeId}`,
-          source: `turn-${event.turnId}`,
-          target: summaryNodeId,
-          data: { kind: 'detail' },
-        })
+          }
+        } else {
+          nodes.push({
+            id: summaryNodeId,
+            type: 'eventNode',
+            position: { x: 0, y: 0 },
+            data: {
+              kind: 'summary',
+              label: summaryLabel,
+              status: summaryStatus,
+              turnId: event.turnId,
+              rawEvent: event,
+            },
+          })
+          edges.push({
+            id: `detail-${summaryNodeId}`,
+            source: `turn-${event.turnId}`,
+            target: summaryNodeId,
+            data: { kind: 'detail' },
+          })
+        }
       }
     } else if (event.type === 'CommandExecution') {
       // Failed commands → individual error nodes

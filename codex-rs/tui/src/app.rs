@@ -28,7 +28,6 @@ use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::sort_agent_picker_threads;
-use crate::websocket_broadcaster;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -37,6 +36,7 @@ use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
+use crate::websocket_broadcaster;
 use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
@@ -1567,26 +1567,40 @@ impl App {
             }
         };
 
-        // Spawn WebSocket event streaming for active thread
-        if let Some(thread_id) = chat_widget.thread_id() {
-            if let Ok(thread) = thread_manager.get_thread(thread_id).await {
-                match websocket_broadcaster::spawn_websocket_infrastructure(
+        // Start WebSocket server immediately so fresh sessions can stream as soon as events arrive.
+        let websocket_stream_port = match websocket_broadcaster::spawn_websocket_server_only(
+            websocket_port,
+        )
+        .await
+        {
+            Ok((_, bound_port)) => {
+                tracing::info!("WebSocket event streaming on ws://127.0.0.1:{bound_port}");
+                Some(bound_port)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "WebSocket server failed on requested port {}: {}. Retrying with an ephemeral port.",
                     websocket_port,
-                    thread,
-                )
-                .await
-                {
-                    Ok(_) => tracing::info!(
-                        "WebSocket event streaming on ws://127.0.0.1:{}",
-                        websocket_port
-                    ),
-                    Err(err) => tracing::warn!(
-                        "WebSocket server failed to start: {}. Continuing without streaming.",
-                        err
-                    ),
+                    err
+                );
+
+                match websocket_broadcaster::spawn_websocket_server_only(0).await {
+                    Ok((_, bound_port)) => {
+                        tracing::info!(
+                            "WebSocket event streaming fallback active on ws://127.0.0.1:{bound_port}"
+                        );
+                        Some(bound_port)
+                    }
+                    Err(fallback_err) => {
+                        tracing::warn!(
+                            "WebSocket fallback server failed to start: {}. Continuing without streaming.",
+                            fallback_err
+                        );
+                        None
+                    }
                 }
             }
-        }
+        };
 
         // Spawn HTTP server and auto-open browser if UI is enabled
         if ui_enabled {
@@ -1614,7 +1628,14 @@ impl App {
 
                             // Auto-open browser if not disabled
                             if !no_browser {
-                                let url = format!("http://127.0.0.1:{}", ui_port);
+                                let url = websocket_stream_port.map_or_else(
+                                    || format!("http://127.0.0.1:{ui_port}/"),
+                                    |stream_port| {
+                                        format!(
+                                            "http://127.0.0.1:{ui_port}/?live=1&wsPort={stream_port}"
+                                        )
+                                    },
+                                );
                                 if let Err(err) = webbrowser::open(&url) {
                                     tracing::warn!("Failed to open browser: {}", err);
                                 }
@@ -1629,7 +1650,8 @@ impl App {
             } else {
                 tracing::warn!(
                     "AgentCanvas UI enabled but no dist path provided. \n\
-                    Use --ui-dist to specify the path to agentcanvas-ui/dist/"
+                    Use --ui-dist to specify the path to agentcanvas-ui/dist/ \n\
+                    or pass --no-ui to disable UI startup."
                 );
             }
         }
@@ -2082,6 +2104,7 @@ impl App {
                 self.chat_widget.on_commit_tick();
             }
             AppEvent::CodexEvent(event) => {
+                websocket_broadcaster::broadcast_protocol_event(&event).await;
                 self.enqueue_primary_event(event).await?;
             }
             AppEvent::Exit(mode) => {
@@ -3270,6 +3293,7 @@ impl App {
                         break;
                     }
                 };
+                websocket_broadcaster::broadcast_protocol_event(&event).await;
                 let refresh_pending_thread_approvals =
                     ThreadEventStore::event_can_change_pending_thread_approvals(&event);
                 let should_send = {

@@ -17,12 +17,37 @@
  * session. Without ?file=, replays the CLI-specified or latest file.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { WebSocketServer } from "ws";
+
+// Load .env.local from repo root (Node doesn't read Vite env files)
+const __dirname = dirname(fileURLToPath(import.meta.url));
+for (const envFile of [".env.local", ".env"]) {
+  // Check both agentcanvas-ui/ and repo root
+  for (const base of [join(__dirname, ".."), join(__dirname, "..", "..")]) {
+    const envPath = join(base, envFile);
+    if (existsSync(envPath)) {
+      for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq === -1) continue;
+        const key = trimmed.slice(0, eq).trim();
+        let val = trimmed.slice(eq + 1).trim();
+        // Strip surrounding quotes
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (!process.env[key]) process.env[key] = val;
+      }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -55,6 +80,26 @@ let defaultRolloutPath = args.find(
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const SUMMARY_DIR = join(homedir(), ".codex", "agentcanvas", "summaries");
 const MAX_SYNTHETIC_SUMMARY_CHARS = 400;
+const SUMMARY_LLM_MODEL = "gpt-4.1-nano";
+const SUMMARY_LLM_MAX_TOKENS = 2048;
+const SUMMARY_LLM_TIMEOUT_MS = 15_000;
+
+const SUMMARY_SYSTEM_PROMPT = `\
+You summarize coding-agent turns into action-oriented prose.
+Lead with the primary action verb: Edited, Ran, Fixed, Searched, Debugged, Read, Created, Deleted, Installed, Built, Tested.
+Include specific files/commands when they are the point of the turn.
+Mention errors prominently if they occurred.
+Return a JSON array where each item has:
+  "turn_id": the turn identifier,
+  "short_summary": action-oriented label, max 80 chars (for graph node display),
+  "detail_summary": expanded detail, max 250 chars (for evidence panel).
+Examples:
+  short_summary: "Explored project structure via pwd, ls, find"
+  detail_summary: "Ran 4 commands to locate portfolio project. Used find with rg to search directories, confirmed working directory with pwd and ls."
+  short_summary: "Edited 2 test files, fixed assertion"
+  detail_summary: "Fixed failing test in src/lib.test.ts by updating expected value. Also edited src/utils.test.ts to add missing import."
+Do not invent facts. Prioritize errors and failures over status text.
+Return ONLY JSON, no markdown fences, no extra text.`;
 
 function sanitizePathComponent(value) {
   return String(value).replace(/[^A-Za-z0-9._-]/g, "_");
@@ -133,13 +178,16 @@ function resolveSummaryNode(threadIdValue, turnIdValue, status, parentTurnId, la
     return fallbackCache.get(turnIdValue);
   }
 
-  return makeFallbackSummaryNode(
+  const fallback = makeFallbackSummaryNode(
     threadIdValue,
     turnIdValue,
     status,
     parentTurnId,
     lastAgentMessage,
   );
+  // makeFallbackSummaryNode returns the full envelope {schema_version, nodes: [...]},
+  // but the UI expects the inner node object {node_id, summary, brief, ...}
+  return fallback?.nodes?.[0] ?? fallback;
 }
 
 function readTurnSummaryNode(threadId, turnId) {
@@ -181,6 +229,84 @@ function findAllRollouts(dir) {
   return results;
 }
 
+function normalizeSessionTitle(value) {
+  if (typeof value !== "string") return null;
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+  return compact.slice(0, 140);
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === "string") return normalizeSessionTitle(content);
+  if (!Array.isArray(content)) return null;
+
+  for (const part of content) {
+    if (typeof part === "string") {
+      const normalized = normalizeSessionTitle(part);
+      if (normalized) return normalized;
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+
+    const text =
+      (typeof part.text === "string" && part.text)
+      || (typeof part.input_text === "string" && part.input_text)
+      || (typeof part.content === "string" && part.content)
+      || null;
+    const normalized = normalizeSessionTitle(text);
+    if (normalized) return normalized;
+  }
+
+  return null;
+}
+
+function extractFirstUserPrompt(obj) {
+  if (!obj || typeof obj !== "object") return null;
+
+  const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : {};
+
+  if (obj.type === "event_msg") {
+    if (payload.type === "user_message") {
+      return normalizeSessionTitle(payload.message);
+    }
+    if (payload.type === "task_started") {
+      return (
+        normalizeSessionTitle(payload.user_prompt)
+        || normalizeSessionTitle(payload.user_input)
+        || normalizeSessionTitle(payload.prompt)
+        || normalizeSessionTitle(payload.input)
+        || normalizeSessionTitle(payload.message)
+      );
+    }
+  }
+
+  if (obj.type === "turn_context") {
+    return (
+      normalizeSessionTitle(payload.user_prompt)
+      || normalizeSessionTitle(payload.userPrompt)
+      || normalizeSessionTitle(payload.user_input)
+      || normalizeSessionTitle(payload.input)
+      || normalizeSessionTitle(payload.prompt)
+      || extractTextFromContent(payload.messages)
+    );
+  }
+
+  if (obj.type === "response_item") {
+    if (payload.type === "user_message") {
+      return (
+        normalizeSessionTitle(payload.message)
+        || normalizeSessionTitle(payload.text)
+        || extractTextFromContent(payload.content)
+      );
+    }
+    if (payload.type === "message" && payload.role === "user") {
+      return extractTextFromContent(payload.content);
+    }
+  }
+
+  return null;
+}
+
 function readSessionInfo(filePath) {
   try {
     const content = readFileSync(filePath, "utf-8");
@@ -189,6 +315,7 @@ function readSessionInfo(filePath) {
     let meta = null;
     let taskStartedCount = 0;
     let turnContextCount = 0;
+    let firstPrompt = null;
 
     for (const line of lines) {
       try {
@@ -196,6 +323,7 @@ function readSessionInfo(filePath) {
         if (obj.type === "session_meta" && !meta) meta = obj.payload;
         if (obj.type === "event_msg" && obj.payload?.type === "task_started") taskStartedCount++;
         if (obj.type === "turn_context") turnContextCount++;
+        if (!firstPrompt) firstPrompt = extractFirstUserPrompt(obj);
       } catch {
         // skip
       }
@@ -207,13 +335,14 @@ function readSessionInfo(filePath) {
     const turns = taskStartedCount > 0 ? taskStartedCount : turnContextCount;
 
     return {
-      date: ts.toISOString().slice(0, 10),
-      time: ts.toISOString().slice(11, 16),
+      date: ts.toLocaleDateString("en-CA", { timeZone: "Asia/Singapore" }),
+      time: ts.toLocaleTimeString("en-GB", { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" }),
       turns,
       source: meta.source || "unknown",
       cwd: meta.cwd || "",
       file: filePath,
       id: meta.id,
+      title: firstPrompt,
     };
   } catch {
     return null;
@@ -277,6 +406,251 @@ function parseOutputJson(outputStr) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-turn evidence collection & LLM summarization
+// ---------------------------------------------------------------------------
+
+/** Collects commands, file paths, errors, and agent messages per turn. */
+class TurnEvidenceCollector {
+  constructor() {
+    /** @type {Map<string, {commands: string[], filePaths: string[], errors: string[], agentMessage: string|null, status: string, parentTurnId: string|null}>} */
+    this.byTurn = new Map();
+  }
+
+  _ensure(turnId) {
+    if (!this.byTurn.has(turnId)) {
+      this.byTurn.set(turnId, {
+        commands: [],
+        filePaths: [],
+        errors: [],
+        agentMessage: null,
+        status: "completed",
+        parentTurnId: null,
+      });
+    }
+    return this.byTurn.get(turnId);
+  }
+
+  addCommand(turnId, cmd, exitCode) {
+    const t = this._ensure(turnId);
+    t.commands.push(cmd);
+    if (exitCode !== 0 && exitCode !== null) {
+      t.errors.push(`${cmd} (exit ${exitCode})`);
+    }
+  }
+
+  addFilePath(turnId, path) {
+    const t = this._ensure(turnId);
+    if (!t.filePaths.includes(path)) t.filePaths.push(path);
+  }
+
+  setAgentMessage(turnId, msg) {
+    const t = this._ensure(turnId);
+    t.agentMessage = msg;
+  }
+
+  setStatus(turnId, status) {
+    const t = this._ensure(turnId);
+    t.status = status;
+  }
+
+  setParentTurnId(turnId, parentTurnId) {
+    const t = this._ensure(turnId);
+    t.parentTurnId = parentTurnId;
+  }
+}
+
+function computeSignal(evidence) {
+  if (evidence.errors.length > 0) return "error";
+  if (evidence.filePaths.length > 0) return "code_changes";
+  if (evidence.commands.length > 0) return "execution";
+  return "status_only";
+}
+
+function buildCompactSummary(turnId, evidence) {
+  const { commands, filePaths, errors, agentMessage, status } = evidence;
+  const parts = [];
+
+  // Lead with action verb + specifics
+  if (errors.length > 0) {
+    const cmdExamples = commands.slice(0, 2).join(", ");
+    parts.push(`Failed ${errors.length} command${errors.length !== 1 ? "s" : ""}${cmdExamples ? ` (${cmdExamples})` : ""}`);
+  } else if (filePaths.length > 0 && commands.length > 0) {
+    const fileExamples = filePaths.slice(0, 2).map(f => f.split("/").pop()).join(", ");
+    const cmdExamples = commands.slice(0, 2).join(", ");
+    parts.push(`Edited ${filePaths.length} file${filePaths.length !== 1 ? "s" : ""} (${fileExamples}), ran ${commands.length} command${commands.length !== 1 ? "s" : ""} (${cmdExamples})`);
+  } else if (filePaths.length > 0) {
+    const fileExamples = filePaths.slice(0, 3).map(f => f.split("/").pop()).join(", ");
+    parts.push(`Edited ${filePaths.length} file${filePaths.length !== 1 ? "s" : ""} (${fileExamples})`);
+  } else if (commands.length > 0) {
+    const cmdExamples = commands.slice(0, 3).join(", ");
+    parts.push(`Ran ${commands.length} command${commands.length !== 1 ? "s" : ""} (${cmdExamples})`);
+  } else {
+    parts.push(status === "completed" ? "Completed" : `Status: ${status}`);
+  }
+
+  // Add agent message snippet
+  if (agentMessage) {
+    const snippet = agentMessage.replace(/\s+/g, " ").trim().slice(0, 100);
+    parts.push(snippet);
+  }
+
+  return parts.join(". ").slice(0, MAX_SYNTHETIC_SUMMARY_CHARS);
+}
+
+function buildEvidenceBasedSummaryNode(threadId, turnId, evidence) {
+  const signal = computeSignal(evidence);
+  const compactSummary = buildCompactSummary(turnId, evidence);
+  const agentSnippet = evidence.agentMessage
+    ? evidence.agentMessage.replace(/\s+/g, " ").trim().slice(0, 120)
+    : null;
+
+  return {
+    node_id: `turn:${turnId}`,
+    parent_id: evidence.parentTurnId ? `turn:${evidence.parentTurnId}` : null,
+    node_type: "turn",
+    title: `Turn ${turnId}`,
+    summary: compactSummary,
+    status: evidence.status,
+    brief: {
+      signal,
+      agent_message: agentSnippet,
+      primary_command: evidence.commands[0] ?? null,
+      primary_file_path: evidence.filePaths[0] ?? null,
+      primary_error: evidence.errors[0] ?? null,
+    },
+    lineage: {
+      parent_turn_id: evidence.parentTurnId ?? null,
+      forked_from_thread_id: null,
+      started_after_rollback: false,
+    },
+    counts: {
+      commands_total: evidence.commands.length,
+      commands_indexed: Math.min(evidence.commands.length, 5),
+      commands_omitted: Math.max(0, evidence.commands.length - 5),
+      file_paths_total: evidence.filePaths.length,
+      file_paths_indexed: Math.min(evidence.filePaths.length, 5),
+      file_paths_omitted: Math.max(0, evidence.filePaths.length - 5),
+      errors_total: evidence.errors.length,
+      errors_indexed: Math.min(evidence.errors.length, 5),
+      errors_omitted: Math.max(0, evidence.errors.length - 5),
+    },
+    digest: {
+      command_examples: evidence.commands.slice(0, 5),
+      file_path_examples: evidence.filePaths.slice(0, 5),
+      error_examples: evidence.errors.slice(0, 5),
+    },
+    evidence: {
+      file_paths: evidence.filePaths.slice(0, 10),
+      commands: evidence.commands.slice(0, 10).map((cmd) => ({
+        command: cmd,
+        exit_code: evidence.errors.some((e) => e.startsWith(cmd)) ? 1 : 0,
+      })),
+      errors: evidence.errors.slice(0, 10),
+    },
+  };
+}
+
+/**
+ * Call OpenAI to generate LLM-enhanced summaries for turns missing persisted ones.
+ * Falls back gracefully if OPENAI_API_KEY is not set.
+ */
+async function generateLLMSummaries(turnEvidence) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.log("[summary] No OPENAI_API_KEY set — using mechanical summaries only");
+    return new Map();
+  }
+
+  const inputs = [];
+  for (const [turnId, ev] of turnEvidence) {
+    inputs.push({
+      turn_id: turnId,
+      status: ev.status,
+      parent_turn_id: ev.parentTurnId,
+      signal: computeSignal(ev),
+      last_agent_message: ev.agentMessage?.slice(0, 200) ?? null,
+      primary_command: ev.commands[0] ?? null,
+      primary_file_path: ev.filePaths[0] ?? null,
+      primary_error: ev.errors[0] ?? null,
+      total_commands: ev.commands.length,
+      total_file_paths: ev.filePaths.length,
+      total_errors: ev.errors.length,
+      command_examples: ev.commands.slice(0, 3),
+      file_path_examples: ev.filePaths.slice(0, 3),
+      error_examples: ev.errors.slice(0, 3),
+    });
+  }
+
+  if (inputs.length === 0) return new Map();
+
+  console.log(`[summary] Calling ${SUMMARY_LLM_MODEL} for ${inputs.length} turn(s)…`);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SUMMARY_LLM_TIMEOUT_MS);
+
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: SUMMARY_LLM_MODEL,
+        max_completion_tokens: SUMMARY_LLM_MAX_TOKENS,
+        temperature: 0.3,
+        messages: [
+          { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+          { role: "user", content: JSON.stringify(inputs, null, 2) },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(`[summary] OpenAI API error ${res.status}: ${text.slice(0, 200)}`);
+      return new Map();
+    }
+
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content ?? "[]";
+    // Parse response — handle markdown fences
+    let items;
+    try {
+      items = JSON.parse(raw);
+    } catch {
+      const start = raw.indexOf("[");
+      const end = raw.lastIndexOf("]");
+      if (start >= 0 && end > start) {
+        items = JSON.parse(raw.slice(start, end + 1));
+      } else {
+        throw new Error("no JSON array found");
+      }
+    }
+
+    const result = new Map();
+    for (const item of items) {
+      if (item.turn_id && (item.short_summary || item.detail_summary || item.summary)) {
+        result.set(item.turn_id, {
+          short: item.short_summary || item.summary || "",
+          detail: item.detail_summary || item.summary || "",
+        });
+      }
+    }
+    console.log(`[summary] Got LLM summaries for ${result.size} turn(s)`);
+    return result;
+  } catch (err) {
+    console.error(`[summary] LLM call failed: ${err.message}`);
+    return new Map();
+  }
+}
+
+function isStructuredSummary(text) {
+  return typeof text === "string" && text.trim().length > 0;
+}
+
 function buildReplayMessages(rolloutLines) {
   const messages = [];
   let threadId = null;
@@ -290,6 +664,7 @@ function buildReplayMessages(rolloutLines) {
   const summaryFallbackByTurn = new Map();
   const turnParentMap = new Map();
   const turnCompletionCache = new Map();
+  const evidenceCollector = new TurnEvidenceCollector();
 
   function ensureTurnOpen(ts) {
     if (!currentTurnId) {
@@ -355,7 +730,10 @@ function buildReplayMessages(rolloutLines) {
       const sub = p.type;
 
       if (sub === "task_started") {
-        if (currentTurnId) turnParentMap.set(p.turn_id, currentTurnId);
+        if (currentTurnId) {
+          turnParentMap.set(p.turn_id, currentTurnId);
+          evidenceCollector.setParentTurnId(p.turn_id, currentTurnId);
+        }
         currentTurnId = p.turn_id;
         messages.push({
           ts,
@@ -394,14 +772,18 @@ function buildReplayMessages(rolloutLines) {
         const completedTurnId = p.turn_id || currentTurnId || "";
         const summaryText = p.last_agent_message ?? "";
         const parentTurnId = turnParentMap.get(completedTurnId) ?? null;
-        const summaryNode = resolveSummaryNode(
-          threadId,
-          completedTurnId,
-          "completed",
-          parentTurnId,
-          summaryText,
-          summaryFallbackByTurn,
-        );
+        // Record agent message and status in evidence
+        if (completedTurnId) {
+          evidenceCollector.setStatus(completedTurnId, "completed");
+          if (summaryText) evidenceCollector.setAgentMessage(completedTurnId, summaryText);
+          if (parentTurnId) evidenceCollector.setParentTurnId(completedTurnId, parentTurnId);
+        }
+        // Try persisted summary first, then build from evidence
+        const persistedNode = readTurnSummaryNode(threadId, completedTurnId);
+        const summaryNode = persistedNode
+          ?? (completedTurnId && evidenceCollector.byTurn.has(completedTurnId)
+            ? buildEvidenceBasedSummaryNode(threadId ?? "", completedTurnId, evidenceCollector.byTurn.get(completedTurnId))
+            : resolveSummaryNode(threadId, completedTurnId, "completed", parentTurnId, summaryText, summaryFallbackByTurn));
         summaryFallbackByTurn.set(completedTurnId, summaryNode);
         if (summaryNode) {
           messages.push({
@@ -440,14 +822,16 @@ function buildReplayMessages(rolloutLines) {
         const completedTurnId = p.turn_id || currentTurnId || "";
         const summaryText = p.last_agent_message ?? "";
         const parentTurnId = turnParentMap.get(completedTurnId) ?? null;
-        const summaryNode = resolveSummaryNode(
-          threadId,
-          completedTurnId,
-          "interrupted",
-          parentTurnId,
-          summaryText,
-          summaryFallbackByTurn,
-        );
+        if (completedTurnId) {
+          evidenceCollector.setStatus(completedTurnId, "interrupted");
+          if (summaryText) evidenceCollector.setAgentMessage(completedTurnId, summaryText);
+          if (parentTurnId) evidenceCollector.setParentTurnId(completedTurnId, parentTurnId);
+        }
+        const persistedNode = readTurnSummaryNode(threadId, completedTurnId);
+        const summaryNode = persistedNode
+          ?? (completedTurnId && evidenceCollector.byTurn.has(completedTurnId)
+            ? buildEvidenceBasedSummaryNode(threadId ?? "", completedTurnId, evidenceCollector.byTurn.get(completedTurnId))
+            : resolveSummaryNode(threadId, completedTurnId, "interrupted", parentTurnId, summaryText, summaryFallbackByTurn));
         summaryFallbackByTurn.set(completedTurnId, summaryNode);
         if (summaryNode) {
           messages.push({
@@ -488,16 +872,17 @@ function buildReplayMessages(rolloutLines) {
           const start = Math.max(0, completedTurnIds.length - numTurns);
           const rolledBackTurnIds = completedTurnIds.splice(start, numTurns);
           for (const rolledBackTurnId of rolledBackTurnIds) {
-            const summaryNode = turnCompletionCache.get(rolledBackTurnId)
-              ?? readTurnSummaryNode(threadId, rolledBackTurnId)
-              ?? summaryFallbackByTurn.get(rolledBackTurnId)
-              ?? makeFallbackSummaryNode(
+            const rollbackFallbackEnvelope = makeFallbackSummaryNode(
                 threadId,
                 rolledBackTurnId,
                 "rolled_back",
                 turnParentMap.get(rolledBackTurnId) ?? null,
                 "",
               );
+            const summaryNode = turnCompletionCache.get(rolledBackTurnId)
+              ?? readTurnSummaryNode(threadId, rolledBackTurnId)
+              ?? summaryFallbackByTurn.get(rolledBackTurnId)
+              ?? rollbackFallbackEnvelope?.nodes?.[0] ?? rollbackFallbackEnvelope;
             if (summaryNode) turnCompletionCache.set(rolledBackTurnId, summaryNode);
             if (!summaryNode) continue;
             messages.push({
@@ -542,6 +927,7 @@ function buildReplayMessages(rolloutLines) {
 
         if (name === "shell_command" || name === "exec_command" || name === "shell" || name === "write_stdin") {
           const { command, cwd } = extractCommand(name, call.arguments);
+          if (currentTurnId) evidenceCollector.addCommand(currentTurnId, command, exitCode);
           messages.push({
             ts,
             msg: {
@@ -569,6 +955,9 @@ function buildReplayMessages(rolloutLines) {
 
         if (name === "apply_patch") {
           const filePaths = extractFilePaths(call.arguments);
+          if (currentTurnId) {
+            for (const fp of filePaths) evidenceCollector.addFilePath(currentTurnId, fp);
+          }
           messages.push({
             ts,
             msg: {
@@ -635,6 +1024,9 @@ function buildReplayMessages(rolloutLines) {
 
         if (name === "apply_patch") {
           const filePaths = extractFilePaths(call.input);
+          if (currentTurnId) {
+            for (const fp of filePaths) evidenceCollector.addFilePath(currentTurnId, fp);
+          }
           messages.push({
             ts,
             msg: {
@@ -730,7 +1122,7 @@ function buildReplayMessages(rolloutLines) {
     });
   }
 
-  return messages;
+  return { messages, evidenceCollector, threadId };
 }
 
 function loadAndBuild(filePath) {
@@ -739,11 +1131,65 @@ function loadAndBuild(filePath) {
   return buildReplayMessages(rolloutLines);
 }
 
+/**
+ * Enhance summary nodes in messages with LLM-generated summaries.
+ * Only enhances turns that don't already have a persisted summary.
+ */
+async function enhanceWithLLM(result) {
+  const { messages, evidenceCollector, threadId } = result;
+  // Identify turns that need LLM enhancement (no persisted summary)
+  const turnsNeedingLLM = new Map();
+  for (const [turnId, ev] of evidenceCollector.byTurn) {
+    const persisted = readTurnSummaryNode(threadId, turnId);
+    if (!persisted) {
+      turnsNeedingLLM.set(turnId, ev);
+    }
+  }
+
+  if (turnsNeedingLLM.size === 0) {
+    console.log("[summary] All turns have persisted summaries");
+    return messages;
+  }
+
+  const llmSummaries = await generateLLMSummaries(turnsNeedingLLM);
+
+  // Replace summary nodes in messages with LLM-enhanced versions
+  if (llmSummaries.size > 0) {
+    for (const msg of messages) {
+      const m = msg.msg;
+      if (m.method !== "agentcanvas/summaryNode") continue;
+      const turnId = m.params?.turnId;
+      const llmResult = llmSummaries.get(turnId);
+      if (!llmResult) continue;
+
+      const node = m.params.node;
+      if (node) {
+        // Use detail_summary as the main summary text
+        if (isStructuredSummary(llmResult.detail)) {
+          node.summary = llmResult.detail;
+        }
+        // Embed short_summary into brief for graph label extraction
+        if (isStructuredSummary(llmResult.short)) {
+          if (!node.brief) node.brief = {};
+          node.brief.short_summary = llmResult.short;
+        }
+      }
+    }
+  }
+
+  return messages;
+}
+
 // Pre-load default if specified
+let defaultResult = null;
 let defaultMessages = null;
 if (defaultRolloutPath) {
-  defaultMessages = loadAndBuild(defaultRolloutPath);
-  console.log(`Pre-loaded ${defaultMessages.length} messages from default rollout`);
+  defaultResult = loadAndBuild(defaultRolloutPath);
+  // Enhance with LLM asynchronously
+  enhanceWithLLM(defaultResult).then((msgs) => {
+    defaultMessages = msgs;
+    console.log(`Pre-loaded ${defaultMessages.length} messages from default rollout`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +1230,8 @@ wss.on("connection", async (ws, req) => {
     if (fileParam) {
       const filePath = resolve(fileParam);
       console.log(`\n[ws] Client requested session: ${filePath}`);
-      replayMessages = loadAndBuild(filePath);
+      const result = loadAndBuild(filePath);
+      replayMessages = await enhanceWithLLM(result);
     }
   } catch (e) {
     console.error("[ws] Error parsing connection URL:", e.message);

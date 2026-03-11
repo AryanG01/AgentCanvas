@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hybrid Memory Search"
+  short_description: "Search past Codex chats with hybrid ranking"
+  default_prompt: "Search my past Codex chat history using the AgentCanvas hybrid summary index. Run a hybrid query, return top matches with thread/session context, and summarize relevant prior attempts."

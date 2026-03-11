@@ -94,4 +94,22 @@ pub enum AppEvent {
         text: String,
         ts: i64,
     },
+
+    /// A parsed AgentCanvas summary node update (turn-level or phase-level).
+    SummaryUpdate {
+        id: String,
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        #[serde(rename = "nodeType")]
+        node_type: String,
+        status: String,
+        #[serde(rename = "summaryText")]
+        summary_text: String,
+        brief: serde_json::Value,
+        counts: serde_json::Value,
+        digest: serde_json::Value,
+        lineage: serde_json::Value,
+        evidence: serde_json::Value,
+        ts: i64,
+    },
 }

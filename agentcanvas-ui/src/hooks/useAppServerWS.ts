@@ -69,7 +69,7 @@ function toNumber(value: unknown): number {
   return Number.isFinite(num) ? num : 0
 }
 
-export function useAppServerWS(overrideUrl?: string | null) {
+export function useAppServerWS(overrideUrl?: string) {
   const addEvent = useGraphStore(s => s.addEvent)
   const setWsStatus = useGraphStore(s => s.setWsStatus)
   const updateTurnLabel = useGraphStore(s => s.updateTurnLabel)
@@ -77,11 +77,10 @@ export function useAppServerWS(overrideUrl?: string | null) {
   const wsRef = useRef<WebSocket | null>(null)
   const backoffRef = useRef(1000)
   const unmountedRef = useRef(false)
-  const url = overrideUrl === null ? null : (overrideUrl ?? storeUrl)
+  const url = overrideUrl ?? storeUrl
 
   useEffect(() => {
     if (USE_MOCK) return  // skip WS entirely in mock mode
-    if (url === null) return  // Disabled
     if (!url) return       // no URL yet — wait for session selection
 
     unmountedRef.current = false
@@ -147,15 +146,24 @@ export function useAppServerWS(overrideUrl?: string | null) {
             const lineage = (node.lineage as Record<string, unknown>) ?? {}
             const evidence = (node.evidence as Record<string, unknown>) ?? {}
             const commands = Array.isArray(evidence.commands) ? evidence.commands : []
+            const childTurnIds = Array.isArray(lineage.child_turn_ids)
+              ? lineage.child_turn_ids.filter((value): value is string => typeof value === 'string')
+              : []
+            const evidenceChildTurnIds = Array.isArray(evidence.child_turn_ids)
+              ? evidence.child_turn_ids.filter((value): value is string => typeof value === 'string')
+              : []
+            const nodeType = (node.node_type as string) === 'phase' ? 'phase' : 'turn'
 
             addEvent({
               type: 'SummaryNode',
               id: (node.node_id as string) ?? `summary-${turnId}`,
               turnId,
+              nodeType,
               status: (node.status as string) ?? 'unknown',
               summaryText: (node.summary as string) ?? '',
               brief: {
                 signal: (brief.signal as string) ?? 'status_only',
+                shortSummary: (brief.short_summary as string) ?? null,
                 agentMessage: (brief.agent_message as string) ?? null,
                 primaryCommand: (brief.primary_command as string) ?? null,
                 primaryFilePath: (brief.primary_file_path as string) ?? null,
@@ -185,11 +193,14 @@ export function useAppServerWS(overrideUrl?: string | null) {
               },
               lineage: {
                 parentTurnId: (lineage.parent_turn_id as string) ?? null,
+                childTurnId: (lineage.child_turn_id as string) ?? null,
+                childTurnIds,
                 forkedFromThreadId: (lineage.forked_from_thread_id as string) ?? null,
                 startedAfterRollback: Boolean(lineage.started_after_rollback),
                 wasRolledBack: Boolean(lineage.was_rolled_back),
               },
               evidence: {
+                childTurnIds: evidenceChildTurnIds,
                 filePaths: Array.isArray(evidence.file_paths)
                   ? evidence.file_paths.filter((value): value is string => typeof value === 'string')
                   : [],
